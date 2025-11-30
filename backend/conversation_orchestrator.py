@@ -9,6 +9,7 @@ from .conversation_events import ConversationEventBus
 from .conversation_manager import ConversationManager
 from .model_engine import StreamingLLMEngine
 from .agent_store import AgentStore
+from .ace_bridge import ACEBridge
 
 
 RESPONSE_DELAY_MS = 0.6
@@ -31,6 +32,7 @@ class ConversationOrchestrator:
         agent_store: AgentStore,
         event_bus: ConversationEventBus,
         engine: StreamingLLMEngine,
+        ace_bridge: ACEBridge,
         *,
         temperature: float = 0.2,
     ) -> None:
@@ -38,6 +40,7 @@ class ConversationOrchestrator:
         self.agent_store = agent_store
         self.event_bus = event_bus
         self.engine = engine
+        self.ace_bridge = ace_bridge
         self.temperature = temperature
         self._locks: Dict[str, asyncio.Lock] = {}
         self._active_tasks: Dict[str, Dict[str, asyncio.Task]] = {}
@@ -123,10 +126,11 @@ class ConversationOrchestrator:
 
         def worker() -> None:
             try:
-                prompt = self.engine.build_prompt(
-                    agent,
-                    history,
-                    trigger.content if trigger else "",
+                prompt = self.ace_bridge.build_prompt(
+                    agent=agent,
+                    conversation_id=conversation_id,
+                    history=history,
+                    user_message=trigger.content if trigger else "",
                     speaker_role=speaker_role,
                     speaker_name=speaker_name,
                     speaker_id=speaker_id,
@@ -184,6 +188,14 @@ class ConversationOrchestrator:
             name=agent.name,
             speaker_id=agent.id,
             message_id=message_id,
+        )
+        self.ace_bridge.schedule_learning(
+            agent=agent,
+            conversation_id=conversation_id,
+            user_message=trigger.content if trigger else "",
+            agent_response=content.strip(),
+            prompt=prompt,
+            diagnostics={"temperature": self.temperature},
         )
         await self.event_bus.broadcast(
             conversation_id,

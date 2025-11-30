@@ -1,14 +1,21 @@
 import {
   Agent,
+  AgentStateView,
   ConversationDetail,
   ConversationMessage,
+  ConversationStateView as BackendConversationStateView,
   ConversationSummary,
+  PlaybookSnapshot,
   createConversation,
   deleteConversation,
+  getAgentState,
   getConversation,
+  getConversationState,
+  getGlobalPlaybook,
   listAgents,
   listConversations,
   renameConversation,
+  resetAgentPlaybook,
   sendConversationMessage,
   updateAgent,
   updateConversationAgents,
@@ -48,6 +55,23 @@ type ConversationState = {
   messages: ChatMessage[]
 }
 
+type InspectorTab = 'conversation' | 'agent' | 'global'
+
+const formatTimestamp = (value?: string | null) => {
+  if (!value) return 'Unknown'
+  try {
+    return new Date(value).toLocaleTimeString()
+  } catch {
+    return value
+  }
+}
+
+const pickRecent = <T,>(list: T[] | undefined | null, limit = 5): T[] => {
+  if (!Array.isArray(list)) return []
+  if (list.length <= limit) return [...list]
+  return list.slice(-limit)
+}
+
 const mapConversationMessage = (message: ConversationMessage): ChatMessage => {
   const normalizedRole = (message.role || '').toUpperCase()
   const speakerType: SpeakerType = normalizedRole === 'AGENT' ? 'agent' : 'person'
@@ -82,6 +106,16 @@ const App = () => {
   const [isAgentModalOpen, setAgentModalOpen] = createSignal(false)
   const [loadingAgents, setLoadingAgents] = createSignal(false)
   const [socketStatus, setSocketStatus] = createSignal<'disconnected' | 'connecting' | 'connected'>('disconnected')
+  const [agentStateView, setAgentStateView] = createSignal<AgentStateView | null>(null)
+  const [conversationInsights, setConversationInsights] =
+    createSignal<BackendConversationStateView | null>(null)
+  const [globalPlaybookView, setGlobalPlaybookView] = createSignal<PlaybookSnapshot | null>(null)
+  const [inspectorTab, setInspectorTab] = createSignal<InspectorTab>('conversation')
+  const [inspectorError, setInspectorError] = createSignal<string | null>(null)
+  const [isAgentInsightsLoading, setAgentInsightsLoading] = createSignal(false)
+  const [isConversationInsightsLoading, setConversationInsightsLoading] = createSignal(false)
+  const [isGlobalPlaybookLoading, setGlobalPlaybookLoading] = createSignal(false)
+  const [isResettingPlaybook, setIsResettingPlaybook] = createSignal(false)
 
   let conversationSocket: WebSocket | null = null
   let socketReconnectTimer: number | undefined
@@ -89,6 +123,28 @@ const App = () => {
   const selectedAgent = () => agents().find((agent: Agent) => agent.id === selectedAgentId())
   const personLabel = () => personName().trim() || 'You'
   const conversation = () => conversationState()
+  const inspectorLoading = () => {
+    const tab = inspectorTab()
+    if (tab === 'conversation') return isConversationInsightsLoading()
+    if (tab === 'agent') return isAgentInsightsLoading()
+    return isGlobalPlaybookLoading()
+  }
+  const inspectorTitle = () => {
+    switch (inspectorTab()) {
+      case 'agent':
+        return selectedAgent()?.name ? `${selectedAgent()?.name} · Memory` : 'Agent memory'
+      case 'global':
+        return 'Global playbook'
+      default:
+        return 'Conversation timeline'
+    }
+  }
+  const agentBullets = () => pickRecent(agentStateView()?.playbook?.bullets, 6)
+  const globalBullets = () => pickRecent(globalPlaybookView()?.bullets, 8)
+  const timelineEntries = () => pickRecent(conversationInsights()?.timeline, 12)
+  const memorySnapshots = () => pickRecent(conversationInsights()?.memory?.snapshots, 5)
+  const agentRecentMessages = () => pickRecent(agentStateView()?.local_memory?.recent_messages, 5)
+  const agentLogs = () => pickRecent(agentStateView()?.logs, 10)
 
   const canSendMessage = () => {
     if (!messageInput().trim()) return false
@@ -208,6 +264,54 @@ const App = () => {
     setActiveAgentIds(detail.active_agents ?? [])
     upsertConversationSummary(detail)
     setMessageInput('')
+    void refreshConversationInsights(detail.id)
+  }
+
+  async function refreshAgentInsights(agentId?: string) {
+    if (!agentId) {
+      setAgentStateView(null)
+      return
+    }
+    setAgentInsightsLoading(true)
+    try {
+      const payload = await getAgentState(agentId, HTTP_BASE)
+      setAgentStateView(payload)
+      setInspectorError(null)
+    } catch (err) {
+      setInspectorError(`Agent inspector unavailable: ${(err as Error).message}`)
+    } finally {
+      setAgentInsightsLoading(false)
+    }
+  }
+
+  async function refreshConversationInsights(conversationId?: string) {
+    if (!conversationId) {
+      setConversationInsights(null)
+      return
+    }
+    setConversationInsightsLoading(true)
+    try {
+      const payload = await getConversationState(conversationId, HTTP_BASE)
+      setConversationInsights(payload)
+      setInspectorError(null)
+    } catch (err) {
+      setInspectorError(`Conversation inspector unavailable: ${(err as Error).message}`)
+    } finally {
+      setConversationInsightsLoading(false)
+    }
+  }
+
+  async function refreshGlobalInsights() {
+    setGlobalPlaybookLoading(true)
+    try {
+      const payload = await getGlobalPlaybook(HTTP_BASE)
+      setGlobalPlaybookView(payload)
+      setInspectorError(null)
+    } catch (err) {
+      setInspectorError(`Global playbook unavailable: ${(err as Error).message}`)
+    } finally {
+      setGlobalPlaybookLoading(false)
+    }
   }
 
   async function initializeConversations() {
@@ -409,6 +513,23 @@ const App = () => {
     setAgentModalOpen(true)
   }
 
+  async function handleResetAgentPlaybook() {
+    const agentId = selectedAgentId()
+    if (!agentId) return
+    if (!window.confirm('Reset playbook for this agent? Learned strategies will be lost.')) return
+    setIsResettingPlaybook(true)
+    try {
+      await resetAgentPlaybook(agentId, HTTP_BASE)
+      setStatusMessage('Agent playbook cleared')
+      await refreshAgentInsights(agentId)
+      await refreshGlobalInsights()
+    } catch (err) {
+      setStatusMessage(`Failed to reset playbook: ${(err as Error).message}`)
+    } finally {
+      setIsResettingPlaybook(false)
+    }
+  }
+
   async function handleSendMessage() {
     const text = messageInput().trim()
     if (!text) return
@@ -434,6 +555,8 @@ const App = () => {
       appendMessages(mapped)
       updateSummaryWithMessage(conversationId, mapped.content)
       setMessageInput('')
+      void refreshConversationInsights(conversationId)
+      void refreshGlobalInsights()
     } catch (err) {
       setChatError((err as Error).message)
     }
@@ -523,6 +646,10 @@ const App = () => {
               streaming: false,
               status: 'done',
             }))
+            if (currentId) {
+              void refreshConversationInsights(currentId)
+              void refreshGlobalInsights()
+            }
           }
           break
         case 'message_error':
@@ -579,6 +706,7 @@ const App = () => {
   onMount(() => {
     refreshAgents()
     void initializeConversations()
+    void refreshGlobalInsights()
   })
 
   createEffect(() => {
@@ -592,6 +720,16 @@ const App = () => {
     if (!selectedAgentId()) {
       setAgentModalOpen(false)
     }
+  })
+
+  createEffect(() => {
+    const agentId = selectedAgentId()
+    void refreshAgentInsights(agentId)
+  })
+
+  createEffect(() => {
+    const conversationId = conversationState().conversationId
+    void refreshConversationInsights(conversationId)
   })
 
   createEffect(() => {
@@ -731,8 +869,8 @@ const App = () => {
         </div>
       </aside>
 
-      <main class="flex flex-1 min-h-0 flex-col gap-6 overflow-hidden p-6">
-        <section class="flex flex-1 min-h-0 flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+      <main class="flex flex-1 min-h-0 gap-6 overflow-hidden p-6">
+        <section class="flex flex-[2] min-h-0 flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="space-y-1">
               <h2 class="text-lg font-semibold">
@@ -883,6 +1021,237 @@ const App = () => {
                 <span class="text-xs text-slate-400">Agents are responding…</span>
               </Show>
             </div>
+          </div>
+        </section>
+        <section class="flex w-96 min-h-0 flex-col gap-3 rounded-2xl border border-slate-800 bg-slate-950/40 p-4 text-sm text-slate-100">
+          <div class="flex items-center justify-between">
+            <div>
+              <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Inspector</p>
+              <h3 class="text-base font-semibold text-slate-100">{inspectorTitle()}</h3>
+            </div>
+            <span class="text-[11px] text-slate-500">{inspectorLoading() ? 'Loading…' : 'Up to date'}</span>
+          </div>
+          <div class="flex gap-2 text-xs">
+            <For each={['conversation', 'agent', 'global'] as InspectorTab[]}>
+              {(tab) => (
+                <button
+                  class={clsx(
+                    'flex-1 rounded-full border px-2 py-1 uppercase tracking-wide transition',
+                    inspectorTab() === tab
+                      ? 'border-emerald-400 bg-emerald-500/10 text-emerald-100'
+                      : 'border-slate-800 bg-slate-900/60 text-slate-400 hover:border-slate-600'
+                  )}
+                  onClick={() => setInspectorTab(tab)}
+                >
+                  {tab === 'conversation' ? 'Conversation' : tab === 'agent' ? 'Agent' : 'Global'}
+                </button>
+              )}
+            </For>
+          </div>
+          <Show when={inspectorError()}>
+            <div class="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+              {inspectorError()}
+            </div>
+          </Show>
+          <div class="flex-1 space-y-4 overflow-y-auto pt-2 text-sm">
+            <Show when={inspectorTab() === 'conversation'}>
+              <div class="space-y-4">
+                <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                  <p class="text-[10px] uppercase tracking-wide text-slate-500">Memory summary</p>
+                  <p class="mt-2 whitespace-pre-wrap text-sm text-slate-100">
+                    {conversationInsights()?.memory?.summary || 'ACE has not summarized this conversation yet.'}
+                  </p>
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                  <p class="text-[10px] uppercase tracking-wide text-slate-500">Active agents</p>
+                  <Show
+                    when={(conversationInsights()?.active_agents?.length ?? 0) > 0}
+                    fallback={<p class="mt-2 text-xs text-slate-500">No agents assigned yet.</p>}
+                  >
+                    <div class="mt-2 flex flex-wrap gap-2 text-xs">
+                      <For each={conversationInsights()?.active_agents || []}>
+                        {(agentId) => (
+                          <span class="rounded-full border border-slate-700 px-2 py-1 text-slate-200">
+                            {getAgentName(agentId) ?? agentId}
+                          </span>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+                <div class="space-y-2">
+                  <div class="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-500">
+                    <span>Timeline</span>
+                    <span>latest {timelineEntries().length}</span>
+                  </div>
+                  <Show when={timelineEntries().length} fallback={<p class="text-xs text-slate-500">No timeline events captured yet.</p>}>
+                    <div class="space-y-2">
+                      <For each={timelineEntries()}>
+                        {(item) => (
+                          <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                            <div class="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-500">
+                              <span>{(item.type || 'event').toString()}</span>
+                              <span>{formatTimestamp(item.timestamp)}</span>
+                            </div>
+                            <p class="mt-2 whitespace-pre-wrap text-sm text-slate-100">
+                              {typeof item.content === 'string' && item.content.trim()
+                                ? (item.content as string)
+                                : typeof item.summary === 'string' && item.summary.trim()
+                                  ? (item.summary as string)
+                                  : JSON.stringify(item)}
+                            </p>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                  <p class="text-[10px] uppercase tracking-wide text-slate-500">Memory snapshots</p>
+                  <Show when={memorySnapshots().length} fallback={<p class="mt-2 text-xs text-slate-500">No distilled memory stored yet.</p>}>
+                    <div class="mt-2 space-y-2">
+                      <For each={memorySnapshots()}>
+                        {(entry) => (
+                          <div class="rounded-lg border border-slate-800/80 bg-slate-900/60 p-2">
+                            <div class="text-[10px] uppercase tracking-wide text-slate-500">
+                              {formatTimestamp(entry.timestamp)}
+                            </div>
+                            <p class="text-sm text-slate-100">{entry.text || '…'}</p>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              </div>
+            </Show>
+            <Show when={inspectorTab() === 'agent'}>
+              <Show when={selectedAgentId()} fallback={<p class="text-xs text-slate-500">Select an agent to inspect ACE learning state.</p>}>
+                <div class="space-y-4">
+                  <div class="flex items-center justify-between text-xs text-slate-400">
+                    <span>Bullets: {agentStateView()?.playbook?.bullets?.length ?? 0}</span>
+                    <div class="flex gap-2">
+                      <button
+                        class="rounded border border-slate-700 px-2 py-1 text-slate-200 hover:border-slate-500"
+                        onClick={() => void refreshAgentInsights(selectedAgentId())}
+                      >
+                        Refresh
+                      </button>
+                      <button
+                        class="rounded border border-rose-500 px-2 py-1 text-rose-200 hover:border-rose-400 disabled:opacity-50"
+                        disabled={isResettingPlaybook()}
+                        onClick={() => void handleResetAgentPlaybook()}
+                      >
+                        {isResettingPlaybook() ? 'Resetting…' : 'Reset'}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                    <p class="text-[10px] uppercase tracking-wide text-slate-500">Local summary</p>
+                    <p class="mt-2 text-sm text-slate-100">
+                      {agentStateView()?.local_memory?.summary || 'No local memory yet.'}
+                    </p>
+                  </div>
+                  <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                    <p class="text-[10px] uppercase tracking-wide text-slate-500">Recent turns</p>
+                    <Show when={agentRecentMessages().length} fallback={<p class="mt-2 text-xs text-slate-500">No recent turns captured.</p>}>
+                      <div class="mt-2 space-y-2 text-xs">
+                        <For each={agentRecentMessages()}>
+                          {(entry) => (
+                            <div class="rounded-lg border border-slate-800/60 bg-slate-900/50 p-2">
+                              <div class="flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-500">
+                                <span>{entry.conversation_id}</span>
+                                <span>{formatTimestamp(entry.timestamp)}</span>
+                              </div>
+                              <p class="mt-1 text-slate-300">User: {entry.user}</p>
+                              <p class="text-slate-100">Agent: {entry.agent}</p>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
+                  <div>
+                    <div class="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-500">
+                      <span>Playbook bullets</span>
+                      <span>showing {agentBullets().length}</span>
+                    </div>
+                    <Show when={agentBullets().length} fallback={<p class="text-xs text-slate-500">No strategies captured yet.</p>}>
+                      <div class="space-y-2">
+                        <For each={agentBullets()}>
+                          {(bullet) => (
+                            <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                              <div class="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-500">
+                                <span>{bullet.section}</span>
+                                <span>Helpful {bullet.helpful}</span>
+                              </div>
+                              <p class="mt-2 text-sm text-slate-100">{bullet.content}</p>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
+                  <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                    <p class="text-[10px] uppercase tracking-wide text-slate-500">Diagnostics log</p>
+                    <Show when={agentLogs().length} fallback={<p class="mt-2 text-xs text-slate-500">No recorded logs.</p>}>
+                      <div class="mt-2 space-y-1 text-xs text-slate-400">
+                        <For each={agentLogs()}>
+                          {(entry) => (
+                            <div class="rounded border border-slate-900/80 bg-slate-900/40 p-2">
+                              <div class="text-[10px] uppercase tracking-wide text-slate-500">
+                                {formatTimestamp(entry.timestamp)}
+                              </div>
+                              <pre class="mt-1 whitespace-pre-wrap font-sans">{JSON.stringify(entry, null, 2)}</pre>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
+                </div>
+              </Show>
+            </Show>
+            <Show when={inspectorTab() === 'global'}>
+              <div class="space-y-4">
+                <div class="flex items-center justify-between text-xs text-slate-400">
+                  <span>Bullets: {globalPlaybookView()?.bullets?.length ?? 0}</span>
+                  <button
+                    class="rounded border border-slate-700 px-2 py-1 text-slate-200 hover:border-slate-500"
+                    onClick={() => void refreshGlobalInsights()}
+                  >
+                    Refresh
+                  </button>
+                </div>
+                <div class="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
+                  <p class="text-[10px] uppercase tracking-wide text-slate-500">Stats</p>
+                  <pre class="mt-2 whitespace-pre-wrap text-xs text-slate-300">
+                    {JSON.stringify(globalPlaybookView()?.stats ?? {}, null, 2)}
+                  </pre>
+                </div>
+                <div>
+                  <div class="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wide text-slate-500">
+                    <span>Global strategies</span>
+                    <span>showing {globalBullets().length}</span>
+                  </div>
+                  <Show when={globalBullets().length} fallback={<p class="text-xs text-slate-500">No shared strategy captured yet.</p>}>
+                    <div class="space-y-2">
+                      <For each={globalBullets()}>
+                        {(bullet) => (
+                          <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                            <div class="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-500">
+                              <span>{bullet.section}</span>
+                              <span>Helpful {bullet.helpful}</span>
+                            </div>
+                            <p class="mt-2 text-sm text-slate-100">{bullet.content}</p>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </div>
+              </div>
+            </Show>
           </div>
         </section>
       </main>

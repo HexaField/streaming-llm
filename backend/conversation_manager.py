@@ -64,6 +64,8 @@ class ConversationManager:
             data = self._read_conversation(path)
             if data and self.max_turns and len(data.get("messages", [])) > self.max_turns:
                 data["messages"] = data["messages"][-self.max_turns :]
+            if data:
+                self._ensure_extended_fields(data)
             return data
 
     def rename(self, conversation_id: str, title: str) -> Optional[Dict[str, Any]]:
@@ -102,6 +104,7 @@ class ConversationManager:
             if not conversation:
                 self.ensure(conversation_id)
                 conversation = self.get(conversation_id) or {}
+            timeline = conversation.setdefault("timeline", [])
             message = {
                 "id": message_id or str(uuid4()),
                 "role": role,
@@ -114,6 +117,19 @@ class ConversationManager:
             messages.append(message)
             if self.max_turns and len(messages) > self.max_turns:
                 conversation["messages"] = messages[-self.max_turns :]
+            timeline.append(
+                {
+                    "type": "message",
+                    "message_id": message["id"],
+                    "role": role,
+                    "speaker_id": speaker_id,
+                    "name": name,
+                    "content": content,
+                    "timestamp": message["timestamp"],
+                }
+            )
+            if len(timeline) > 500:
+                conversation["timeline"] = timeline[-500:]
             conversation["updated_at"] = self._timestamp()
             self._write_conversation(conversation)
             return message
@@ -141,6 +157,61 @@ class ConversationManager:
             self._write_conversation(conversation)
             return conversation
 
+    def record_memory(
+        self,
+        conversation_id: str,
+        *,
+        summary: Optional[str] = None,
+        distilled: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            conversation = self.get(conversation_id)
+            if not conversation:
+                return
+            memory = conversation.setdefault("memory", {})
+            if summary:
+                memory["summary"] = summary.strip()
+            snapshots = memory.setdefault("snapshots", [])
+            if distilled:
+                snapshots.append(
+                    {
+                        "timestamp": self._timestamp(),
+                        "text": distilled.strip(),
+                    }
+                )
+                memory["snapshots"] = snapshots[-50:]
+            conversation["memory"] = memory
+            conversation["updated_at"] = self._timestamp()
+            self._write_conversation(conversation)
+
+    def record_event(self, conversation_id: str, event: Dict[str, Any]) -> None:
+        with self._lock:
+            conversation = self.get(conversation_id)
+            if not conversation:
+                return
+            timeline = conversation.setdefault("timeline", [])
+            payload = dict(event)
+            payload.setdefault("timestamp", self._timestamp())
+            timeline.append(payload)
+            conversation["timeline"] = timeline[-500:]
+            conversation["updated_at"] = self._timestamp()
+            self._write_conversation(conversation)
+
+    def inspect(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        conversation = self.get(conversation_id)
+        if not conversation:
+            return None
+        return {
+            "id": conversation.get("id"),
+            "title": conversation.get("title"),
+            "messages": conversation.get("messages", []),
+            "timeline": conversation.get("timeline", []),
+            "memory": conversation.get("memory", {}),
+            "active_agents": conversation.get("active_agents", []),
+            "metadata": conversation.get("metadata", {}),
+            "updated_at": conversation.get("updated_at"),
+        }
+
     def _base_conversation(self, conversation_id: str, title: Optional[str] = None) -> Dict[str, Any]:
         now = self._timestamp()
         return {
@@ -150,6 +221,9 @@ class ConversationManager:
             "updated_at": now,
             "messages": [],
             "active_agents": [],
+            "timeline": [],
+            "memory": {"summary": None, "snapshots": []},
+            "metadata": {},
         }
 
     def _conversation_path(self, conversation_id: str) -> Path:
@@ -169,6 +243,11 @@ class ConversationManager:
     def _write_conversation(self, data: Dict[str, Any]) -> None:
         path = self._conversation_path(data["id"])
         path.write_text(json.dumps(data, indent=2))
+
+    def _ensure_extended_fields(self, data: Dict[str, Any]) -> None:
+        data.setdefault("timeline", [])
+        data.setdefault("memory", {"summary": None, "snapshots": []})
+        data.setdefault("metadata", {})
 
     def _default_title(self, conversation_id: str) -> str:
         return f"Conversation {conversation_id[:8]}"

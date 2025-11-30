@@ -60,6 +60,76 @@ export interface ConversationDetail extends ConversationSummary {
   messages: ConversationMessage[];
 }
 
+export interface PlaybookBullet {
+  id: string;
+  section: string;
+  content: string;
+  helpful: number;
+  harmful: number;
+  neutral: number;
+}
+
+export interface PlaybookSnapshot {
+  stats?: Record<string, unknown>;
+  bullets: PlaybookBullet[];
+}
+
+export interface AgentStateView {
+  agent_id: string;
+  name?: string;
+  system_prompt?: string;
+  markdown_context?: string;
+  playbook: PlaybookSnapshot;
+  local_memory?: {
+    summary?: string | null;
+    recent_messages?: Array<{
+      conversation_id?: string;
+      user?: string;
+      agent?: string;
+      timestamp?: string;
+    }>;
+  };
+  diagnostics?: Record<string, unknown>;
+  reflection?: unknown;
+  curation?: unknown;
+  last_run?: Record<string, unknown>;
+  logs?: Array<{
+    timestamp?: string;
+    event?: string;
+    [key: string]: unknown;
+  }>;
+  global_memory?: PlaybookSnapshot;
+}
+
+export interface ConversationTimelineEvent {
+  type?: string;
+  timestamp?: string;
+  role?: string;
+  speaker_id?: string;
+  name?: string;
+  content?: string;
+  [key: string]: unknown;
+}
+
+export interface ConversationStateView {
+  id: string;
+  title?: string;
+  messages: ConversationMessage[];
+  timeline: ConversationTimelineEvent[];
+  memory: {
+    summary?: string | null;
+    snapshots?: Array<{
+      timestamp?: string;
+      text?: string;
+      [key: string]: unknown;
+    }>;
+  };
+  active_agents: string[];
+  metadata?: Record<string, unknown>;
+  updated_at?: string;
+  global_playbook: PlaybookSnapshot;
+}
+
 export interface ConversationMessageRequest {
   content: string;
   speaker_role?: string;
@@ -220,6 +290,41 @@ export async function sendConversationMessage(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function getAgentState(agentId: string, apiBase = "http://localhost:8000"): Promise<AgentStateView> {
+  const res = await fetch(`${apiBase}/agents/${agentId}/state`);
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function getAgentPlaybook(agentId: string, apiBase = "http://localhost:8000"): Promise<PlaybookSnapshot> {
+  const res = await fetch(`${apiBase}/agents/${agentId}/playbook`);
+  await ensureOk(res);
+  const payload = await res.json();
+  return payload.playbook as PlaybookSnapshot;
+}
+
+export async function resetAgentPlaybook(agentId: string, apiBase = "http://localhost:8000"): Promise<void> {
+  const res = await fetch(`${apiBase}/agents/${agentId}/playbook`, {
+    method: "DELETE",
+  });
+  await ensureOk(res);
+}
+
+export async function getConversationState(
+  conversationId: string,
+  apiBase = "http://localhost:8000"
+): Promise<ConversationStateView> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}/state`);
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function getGlobalPlaybook(apiBase = "http://localhost:8000"): Promise<PlaybookSnapshot> {
+  const res = await fetch(`${apiBase}/playbooks/global`);
   await ensureOk(res);
   return res.json();
 }

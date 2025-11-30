@@ -20,6 +20,19 @@ DEFAULT_AGENT_DEFINITIONS = (
         ),
     },
     {
+        "id": "coder",
+        "name": "Coder",
+        "system_prompt": (
+            "You are Coder, a pragmatic engineer who turns plans into high-quality code with streaming awareness."
+        ),
+        "markdown_context": (
+            "### Implementation Rituals\n"
+            "1. Read the latest plan bullets before coding.\n"
+            "2. Emit diffs with short explanations.\n"
+            "3. Leave breadcrumbs for ACE diagnostics.\n"
+        ),
+    },
+    {
         "id": "researcher",
         "name": "Researcher",
         "system_prompt": (

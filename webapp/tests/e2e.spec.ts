@@ -42,4 +42,23 @@ test.describe('StreamingLLM multi-agent chat', () => {
 
     await expect(page.getByText('stopped')).not.toBeVisible({ timeout: 5_000 })
   })
+
+  test('inspector surfaces ACE state', async ({ page }) => {
+    await page.goto('/')
+
+    const plannerButton = page.getByRole('button', { name: /^Planner/i }).first()
+    await expect(plannerButton).toBeVisible()
+    await plannerButton.click()
+
+    await expect(page.getByRole('button', { name: 'Conversation' })).toBeVisible()
+
+    await expect(page.getByText('Memory summary').first()).toBeVisible({ timeout: 30_000 })
+
+    await page.getByRole('button', { name: 'Agent' }).click()
+    await expect(page.getByText('Local summary').first()).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByRole('button', { name: 'Reset' })).toBeVisible()
+
+    await page.getByRole('button', { name: 'Global' }).click()
+    await expect(page.getByText('Global strategies').first()).toBeVisible({ timeout: 30_000 })
+  })
 })

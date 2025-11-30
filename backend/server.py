@@ -16,6 +16,7 @@ from .conversation_manager import ConversationManager
 from .conversation_orchestrator import ConversationOrchestrator
 from .model_engine import StreamingLLMEngine
 from .settings import get_settings
+from .ace_bridge import ACEBridge
 
 
 class StreamCancelled(Exception):
@@ -27,6 +28,7 @@ conversation_manager = ConversationManager(
     settings.conversations_dir,
     max_turns=settings.conversation_max_turns,
 )
+ace_bridge = ACEBridge(settings, conversation_manager)
 event_bus = ConversationEventBus()
 engine: Optional[StreamingLLMEngine] = None
 orchestrator: Optional[ConversationOrchestrator] = None
@@ -47,6 +49,7 @@ def get_orchestrator() -> ConversationOrchestrator:
             agent_store,
             event_bus,
             get_engine(),
+            ace_bridge,
         )
     return orchestrator
 
@@ -321,10 +324,11 @@ async def chat(websocket: WebSocket) -> None:
             effective_name = latest.get("name") or latest.get("speaker_name") or effective_name
             effective_id = latest.get("speaker_id") or effective_id
 
-        prompt = get_engine().build_prompt(
-            agent,
-            history,
-            effective_message,
+        prompt = ace_bridge.build_prompt(
+            agent=agent,
+            conversation_id=conversation_id,
+            history=history,
+            user_message=effective_message,
             speaker_role=effective_role,
             speaker_name=effective_name,
             speaker_id=effective_id,
@@ -376,8 +380,60 @@ async def chat(websocket: WebSocket) -> None:
             name=agent.name,
             speaker_id=agent.id,
         )
+        ace_bridge.schedule_learning(
+            agent=agent,
+            conversation_id=conversation_id,
+            user_message=effective_message,
+            agent_response=assistant_text,
+            prompt=prompt,
+            diagnostics={
+                "temperature": _safe_float(options.get("temperature")),
+                "max_new_tokens": _safe_int(options.get("max_new_tokens")),
+            },
+        )
     if not cancelled:
         await websocket.close()
+
+
+@app.get("/agents/{agent_id}/state")
+def inspect_agent(agent_id: str) -> Dict[str, Any]:
+    state = ace_bridge.get_agent_state(agent_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Agent state not found")
+    agent = agent_store.get_agent(agent_id)
+    if agent:
+        state["system_prompt"] = agent.system_prompt
+        state["markdown_context"] = agent.markdown_context
+        state["name"] = agent.name
+    return state
+
+
+@app.get("/agents/{agent_id}/playbook")
+def get_agent_playbook_state(agent_id: str) -> Dict[str, Any]:
+    if not agent_store.get_agent(agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return ace_bridge.get_agent_playbook_payload(agent_id)
+
+
+@app.delete("/agents/{agent_id}/playbook")
+def reset_agent_playbook(agent_id: str) -> Dict[str, str]:
+    if not agent_store.get_agent(agent_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    ace_bridge.reset_agent_playbook(agent_id)
+    return {"status": "cleared"}
+
+
+@app.get("/conversations/{conversation_id}/state")
+def inspect_conversation(conversation_id: str) -> Dict[str, Any]:
+    state = ace_bridge.get_conversation_state(conversation_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return state
+
+
+@app.get("/playbooks/global")
+def get_global_playbook() -> Dict[str, Any]:
+    return ace_bridge.get_global_playbook_state()
 
 
 def _safe_float(value: Any) -> Optional[float]:

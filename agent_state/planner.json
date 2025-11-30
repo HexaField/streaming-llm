@@ -1,0 +1,1 @@
+{"local_memory": {"summary": "Remember focus", "recent_messages": [{"conversation_id": "abc", "user": "Hello", "agent": "Hi", "timestamp": "2024-01-01T00:00:00Z"}]}, "logs": [{"timestamp": "2024-01-01T00:00:00Z", "event": "turn", "summary": "Sample"}]}

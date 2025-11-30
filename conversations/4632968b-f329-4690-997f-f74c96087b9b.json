@@ -1,0 +1,43 @@
+{
+  "id": "4632968b-f329-4690-997f-f74c96087b9b",
+  "title": "Inspectable",
+  "created_at": "2025-11-30T02:51:49.134363+00:00",
+  "updated_at": "2025-11-30T02:51:49.136155+00:00",
+  "messages": [
+    {
+      "id": "61874a99-704f-4381-aa37-eb422e1ea0b8",
+      "role": "PERSON",
+      "name": "Tester",
+      "speaker_id": "user-1",
+      "content": "User turn",
+      "timestamp": "2025-11-30T02:51:49.135520+00:00"
+    }
+  ],
+  "active_agents": [],
+  "timeline": [
+    {
+      "type": "message",
+      "message_id": "61874a99-704f-4381-aa37-eb422e1ea0b8",
+      "role": "PERSON",
+      "speaker_id": "user-1",
+      "name": "Tester",
+      "content": "User turn",
+      "timestamp": "2025-11-30T02:51:49.135520+00:00"
+    },
+    {
+      "type": "diagnostic",
+      "content": "ACE reflection",
+      "timestamp": "2025-11-30T02:51:49.136152+00:00"
+    }
+  ],
+  "memory": {
+    "summary": "Keep critical context",
+    "snapshots": [
+      {
+        "timestamp": "2025-11-30T02:51:49.135977+00:00",
+        "text": "Snapshot 1"
+      }
+    ]
+  },
+  "metadata": {}
+}
