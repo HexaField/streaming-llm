@@ -41,6 +41,10 @@ python setup.py develop
 CUDA_VISIBLE_DEVICES=0 python examples/run_streaming_llama.py  --enable_streaming
 ```
 
+### Multi-agent demo configuration
+
+The FastAPI-based multi-agent demo stores user-editable agent definitions as Markdown files. By default these live in the `.agents/` directory, which is gitignored so local tweaks never appear in commits. Set `STREAMING_LLM_AGENTS_DIR=/path/to/dir` before starting the backend to point at a different location. On first launch the backend will seed two demo agents (`planner` and `researcher`) into the chosen directory if they are missing.
+
 ## FAQ
 
 1. **What does "working on infinite-length inputs" imply for LLMs?**
