@@ -122,9 +122,41 @@ async def chat(websocket: WebSocket) -> None:
     try:
         conversation_id = conversation_manager.ensure(payload.get("conversation_id"))
         history = conversation_manager.history(conversation_id)
-        if user_message:
-            conversation_manager.append(conversation_id, "USER", user_message)
-        prompt = get_engine().build_prompt(agent, history, user_message)
+        speaker_role_raw = str(payload.get("speaker_role") or "").strip()
+        speaker_role = (speaker_role_raw or "PERSON").upper()
+        speaker_name = str(payload.get("speaker_name") or "User").strip() or "User"
+        speaker_id = str(payload.get("speaker_id") or "person-local").strip() or "person-local"
+        skip_user_append = _as_bool(payload.get("skip_user_append"))
+        prompt_from_latest = _as_bool(payload.get("prompt_from_latest"))
+
+        if user_message and not skip_user_append:
+            conversation_manager.append(
+                conversation_id,
+                speaker_role,
+                user_message,
+                name=speaker_name,
+                speaker_id=speaker_id,
+            )
+
+        effective_message = user_message
+        effective_role = speaker_role
+        effective_name = speaker_name
+        effective_id = speaker_id
+        if prompt_from_latest and history:
+            latest = history[-1]
+            effective_message = latest.get("content", "")
+            effective_role = str(latest.get("role") or effective_role).upper()
+            effective_name = latest.get("name") or latest.get("speaker_name") or effective_name
+            effective_id = latest.get("speaker_id") or effective_id
+
+        prompt = get_engine().build_prompt(
+            agent,
+            history,
+            effective_message,
+            speaker_role=effective_role,
+            speaker_name=effective_name,
+            speaker_id=effective_id,
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to prepare chat session")
         await _send_ws_error(websocket, f"Backend error: {exc}")
@@ -165,7 +197,13 @@ async def chat(websocket: WebSocket) -> None:
     await loop.run_in_executor(None, run_generation)
     assistant_text = "".join(assistant_chunks).strip()
     if assistant_text and not cancelled:
-        conversation_manager.append(conversation_id, "ASSISTANT", assistant_text)
+        conversation_manager.append(
+            conversation_id,
+            "AGENT",
+            assistant_text,
+            name=agent.name,
+            speaker_id=agent.id,
+        )
     if not cancelled:
         await websocket.close()
 
@@ -186,6 +224,16 @@ def _safe_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
 
 
 async def _send_ws_error(websocket: WebSocket, message: str) -> None:

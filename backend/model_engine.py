@@ -41,6 +41,10 @@ class StreamingLLMEngine:
         agent: Agent,
         history: Iterable[Dict[str, str]],
         user_message: str,
+        *,
+        speaker_role: str = "PERSON",
+        speaker_name: Optional[str] = None,
+        speaker_id: Optional[str] = None,
     ) -> str:
         sections: List[str] = []
         sections.append(f"System:\n{agent.system_prompt.strip()}")
@@ -49,12 +53,34 @@ class StreamingLLMEngine:
         if history:
             history_lines = []
             for turn in history:
-                role = turn.get("role", "user").upper()
+                role = str(turn.get("role", "USER")).upper()
                 content = turn.get("content", "").strip()
-                history_lines.append(f"{role}: {content}")
+                name = turn.get("name") or turn.get("speaker_name")
+                turn_speaker_id = turn.get("speaker_id")
+                label = self._format_label(role, name, turn_speaker_id)
+                history_lines.append(f"{label}: {content}")
             sections.append("Conversation History:\n" + "\n".join(history_lines))
-        sections.append(f"USER: {user_message.strip()}\nASSISTANT:")
+        user_label = self._format_label(speaker_role, speaker_name, speaker_id)
+        agent_label = self._format_label("AGENT", agent.name, agent.id)
+        sections.append(f"{user_label}: {user_message.strip()}\n{agent_label}:")
         return "\n\n".join(sections)
+
+    @staticmethod
+    def _format_label(
+        role: str,
+        name: Optional[str],
+        speaker_id: Optional[str],
+    ) -> str:
+        clean_role = (role or "UNKNOWN").upper()
+        label = clean_role
+        metadata: List[str] = []
+        if name:
+            metadata.append(name)
+        elif speaker_id:
+            metadata.append(speaker_id)
+        if metadata:
+            label += f" ({' / '.join(metadata)})"
+        return label
 
     def stream(
         self,

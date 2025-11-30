@@ -6,12 +6,18 @@ import { createStore } from 'solid-js/store'
 const HTTP_BASE = import.meta.env.VITE_BACKEND_HTTP ?? 'http://localhost:8000'
 const WS_URL = import.meta.env.VITE_BACKEND_WS ?? 'ws://localhost:8000/ws/chat'
 
+type SpeakerType = 'person' | 'agent'
+
 type ChatMessage = {
   id: string
   role: 'user' | 'assistant'
   content: string
   streaming?: boolean
   status?: 'done' | 'error'
+  agentId?: string
+  speakerType: SpeakerType
+  speakerName?: string
+  speakerId?: string
 }
 
 type ConversationState = {
@@ -20,13 +26,30 @@ type ConversationState = {
 }
 
 const randomId = () => Math.random().toString(36).slice(2)
+const PERSON_ROLE = 'PERSON'
+const PERSON_ID = 'person-local'
+const RESPONSE_DELAY_MS = 600
+const RESPONSE_DELAY_STEP_MS = 200
+
+type ResponseTask = {
+  agentId: string
+  conversationId: string
+  trigger: ChatMessage
+  skipUserAppend: boolean
+  promptFromLatest: boolean
+  delayMs: number
+}
 
 const App = () => {
   const [agents, setAgents] = createSignal<Agent[]>([])
   const [selectedAgentId, setSelectedAgentId] = createSignal<string>()
   const [draftAgents, setDraftAgents] = createStore<Record<string, Agent>>({})
-  const [conversations, setConversations] = createSignal<Record<string, ConversationState>>({})
+  const [conversationState, setConversationState] = createSignal<ConversationState>({
+    messages: [],
+  })
+  const [activeAgentIds, setActiveAgentIds] = createSignal<string[]>([])
   const [messageInput, setMessageInput] = createSignal('')
+  const [personName, setPersonName] = createSignal('You')
   const [temperature, setTemperature] = createSignal(0.2)
   const [chatError, setChatError] = createSignal<string | null>(null)
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null)
@@ -38,15 +61,48 @@ const App = () => {
     messageId: string
     cancel: () => void
   } | null>(null)
+  const pendingResponseResolvers = new Map<string, () => void>()
+  const queuedResponseAgents = new Set<string>()
+  let responseQueue: ResponseTask[] = []
+  let responseQueueProcessing = false
+  let responseQueueToken = 0
 
   const selectedAgent = () => agents().find((agent: Agent) => agent.id === selectedAgentId())
+  const personLabel = () => personName().trim() || 'You'
 
-  const selectedConversation = () => {
-    const agentId = selectedAgentId()
-    if (!agentId) {
-      return { messages: [] } satisfies ConversationState
+  const conversation = () => conversationState()
+
+  const findMessageById = (messageId: string) =>
+    conversationState().messages.find((message) => message.id === messageId)
+
+  const activeAgents = () =>
+    activeAgentIds()
+      .map((id) => agents().find((agent: Agent) => agent.id === id))
+      .filter(Boolean) as Agent[]
+
+  const isAgentActive = (agentId: string | undefined) => {
+    if (!agentId) return false
+    return activeAgentIds().includes(agentId)
+  }
+
+  const getAgentName = (agentId: string | undefined) => {
+    if (!agentId) return undefined
+    return agents().find((agent: Agent) => agent.id === agentId)?.name
+  }
+
+  const messageSpeakerLabel = (message: ChatMessage) => {
+    if (message.speakerName && message.speakerName.trim()) {
+      return message.speakerName.trim()
     }
-    return conversations()[agentId] ?? { messages: [] }
+    if (message.speakerType === 'agent' && message.agentId) {
+      return getAgentName(message.agentId) ?? message.agentId
+    }
+    return message.role === 'user' ? 'You' : 'Assistant'
+  }
+
+  const canSendMessage = () => {
+    if (!messageInput().trim()) return false
+    return activeAgents().length > 0
   }
 
   onMount(() => {
@@ -66,13 +122,200 @@ const App = () => {
     }
   })
 
+  function updateActiveAgents(updater: (prev: string[]) => string[]) {
+    setActiveAgentIds((prev: string[]) => {
+      const next = updater(prev)
+      if (!next.length) {
+        setSelectedAgentId(undefined)
+      } else {
+        const current = selectedAgentId()
+        if (!current || !next.includes(current)) {
+          setSelectedAgentId(next[0])
+        }
+      }
+      return next
+    })
+  }
+
+  function addAgentToConversation(agentId: string) {
+    updateActiveAgents((prev) => (prev.includes(agentId) ? prev : [...prev, agentId]))
+    setSelectedAgentId(agentId)
+  }
+
+  function removeAgentFromConversation(agentId: string) {
+    updateActiveAgents((prev) => prev.filter((id) => id !== agentId))
+    const stream = activeStream()
+    if (stream?.agentId === agentId) {
+      stopActiveStream(true)
+    }
+  }
+
+  function ensureConversationId(): string {
+    const existing = conversationState().conversationId
+    if (existing) {
+      return existing
+    }
+    const generated =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `conversation-${Date.now().toString(36)}-${randomId()}`
+    setConversationState((prev) => ({ conversationId: generated, messages: [...prev.messages] }))
+    return generated
+  }
+
+  function resetResponseQueue() {
+    responseQueue = []
+    responseQueueToken += 1
+    responseQueueProcessing = false
+    queuedResponseAgents.clear()
+  }
+
+  function enqueueResponseTasks(tasks: ResponseTask[]) {
+    const eligible = tasks.filter((task) => !queuedResponseAgents.has(task.agentId))
+    if (!eligible.length) return
+    eligible.forEach((task) => queuedResponseAgents.add(task.agentId))
+    responseQueue = [...responseQueue, ...eligible]
+    void processResponseQueue(responseQueueToken)
+  }
+
+  async function processResponseQueue(token: number) {
+    if (responseQueueProcessing) return
+    responseQueueProcessing = true
+    while (responseQueue.length && token === responseQueueToken) {
+      const task = responseQueue[0]
+      await waitMs(task.delayMs)
+      if (token !== responseQueueToken) {
+        break
+      }
+      await runResponseTask(task)
+      if (token !== responseQueueToken) {
+        break
+      }
+      responseQueue = responseQueue.slice(1)
+    }
+    responseQueueProcessing = false
+    if (responseQueue.length) {
+      void processResponseQueue(responseQueueToken)
+    }
+  }
+
+  function waitMs(ms: number) {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms)
+    })
+  }
+
+  function resolveResponse(messageId: string) {
+    const resolver = pendingResponseResolvers.get(messageId)
+    if (resolver) {
+      resolver()
+      pendingResponseResolvers.delete(messageId)
+    }
+    const message = findMessageById(messageId)
+    if (message?.agentId) {
+      queuedResponseAgents.delete(message.agentId)
+    }
+  }
+
+  function queueAgentResponses(message: ChatMessage, conversationId: string) {
+    const availableAgents = [...activeAgentIds()]
+    if (!availableAgents.length) {
+      return
+    }
+    const speakerAgentId =
+      message.speakerType === 'agent' ? message.agentId ?? message.speakerId : undefined
+    let targets = availableAgents.filter((agentId) => agentId !== speakerAgentId)
+    if (!targets.length) {
+      return
+    }
+    if (message.speakerType === 'person') {
+      const preferred = selectedAgentId()
+      if (preferred && targets.includes(preferred)) {
+        targets = targets.filter((agentId) => agentId !== preferred)
+        targets.unshift(preferred)
+      }
+    }
+    const tasks: ResponseTask[] = targets.map((agentId, index) => ({
+      agentId,
+      conversationId,
+      trigger: message,
+      skipUserAppend: message.speakerType === 'person' ? index !== 0 : true,
+      promptFromLatest: message.speakerType === 'person' ? index !== 0 : true,
+      delayMs: RESPONSE_DELAY_MS + index * RESPONSE_DELAY_STEP_MS,
+    }))
+    enqueueResponseTasks(tasks)
+  }
+
+  function runResponseTask(task: ResponseTask): Promise<void> {
+    return new Promise((resolve) => {
+      const agent = agents().find((item: Agent) => item.id === task.agentId)
+      if (!agent || !isAgentActive(agent.id)) {
+        queuedResponseAgents.delete(task.agentId)
+        resolve()
+        return
+      }
+      const assistantId = randomId()
+      const assistantMessage: ChatMessage = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        streaming: true,
+        agentId: agent.id,
+        speakerType: 'agent',
+        speakerName: agent.name,
+        speakerId: agent.id,
+      }
+      appendMessages(assistantMessage)
+      try {
+        const cancel = streamChat({
+          backendUrl: WS_URL,
+          agentId: agent.id,
+          conversationId: task.conversationId,
+          message: task.trigger.content,
+          speakerRole: task.trigger.speakerType === 'person' ? PERSON_ROLE : 'AGENT',
+          speakerName:
+            task.trigger.speakerName ??
+            (task.trigger.speakerType === 'person' ? personLabel() : agent.name),
+          speakerId:
+            task.trigger.speakerType === 'person'
+              ? task.trigger.speakerId ?? PERSON_ID
+              : task.trigger.agentId ?? task.trigger.speakerId ?? agent.id,
+          skipUserAppend: task.skipUserAppend,
+          promptFromLatest: task.promptFromLatest,
+          options: { temperature: temperature() },
+          onEvent: (event: ChatEvent) => handleChatEvent(assistantId, event)
+        })
+        pendingResponseResolvers.set(assistantId, resolve)
+        setActiveStream({ agentId: agent.id, messageId: assistantId, cancel })
+      } catch (err) {
+        mutateMessage(assistantId, (message) => ({
+          ...message,
+          streaming: false,
+          status: 'error',
+        }))
+        setChatError((err as Error).message)
+        queuedResponseAgents.delete(agent.id)
+        resolve()
+      }
+    })
+  }
+
   async function refreshAgents() {
     setLoadingAgents(true)
     try {
       const result: Agent[] = await listAgents(HTTP_BASE)
       setAgents(result)
-      if (!selectedAgentId() && result.length) {
-        setSelectedAgentId(result[0].id)
+      const validActive = activeAgentIds().filter((id) => result.some((agent: Agent) => agent.id === id))
+      let nextActive = validActive
+      if (!nextActive.length && result.length) {
+        nextActive = [result[0].id]
+      }
+      setActiveAgentIds(nextActive)
+      const currentSelected = selectedAgentId()
+      if (!nextActive.length) {
+        setSelectedAgentId(undefined)
+      } else if (!currentSelected || !nextActive.includes(currentSelected)) {
+        setSelectedAgentId(nextActive[0])
       }
       result.forEach((agent: Agent) => setDraftAgents(agent.id, { ...agent }))
       setStatusMessage(null)
@@ -137,69 +380,75 @@ const App = () => {
     }
     setAgents((prev: Agent[]) => [...prev, template])
     setDraftAgents(id, { ...template })
-    setSelectedAgentId(id)
+    addAgentToConversation(id)
     setStatusMessage('New agent ready. Save to persist.')
     setAgentModalOpen(true)
   }
 
-  function updateConversation(agentId: string, builder: (state: ConversationState) => ConversationState) {
-    setConversations((prev: Record<string, ConversationState>) => {
-      const current = prev[agentId] ?? { messages: [] }
+  function updateConversation(builder: (state: ConversationState) => ConversationState) {
+    setConversationState((prev: ConversationState) => {
       const nextState = builder({
-        conversationId: current.conversationId,
-        messages: [...current.messages]
+        conversationId: prev.conversationId,
+        messages: [...prev.messages]
       })
-      return { ...prev, [agentId]: nextState }
+      return nextState
     })
   }
 
-  function appendMessages(agentId: string, ...messages: ChatMessage[]) {
-    updateConversation(agentId, (state) => ({
+  function appendMessages(...messages: ChatMessage[]) {
+    updateConversation((state) => ({
       conversationId: state.conversationId,
       messages: [...state.messages, ...messages]
     }))
   }
 
-  function mutateMessage(agentId: string, messageId: string, transform: (message: ChatMessage) => ChatMessage) {
-    updateConversation(agentId, (state) => ({
+  function mutateMessage(messageId: string, transform: (message: ChatMessage) => ChatMessage) {
+    updateConversation((state) => ({
       ...state,
       messages: state.messages.map((message) => (message.id === messageId ? transform(message) : message))
     }))
   }
 
-  function setConversationId(agentId: string, conversationId: string | undefined) {
-    updateConversation(agentId, (state) => ({
+  function setConversationId(conversationId: string | undefined) {
+    updateConversation((state) => ({
       ...state,
       conversationId: conversationId ?? state.conversationId
     }))
   }
 
-  function finalizeAssistant(agentId: string, messageId: string, isError = false) {
-    mutateMessage(agentId, messageId, (message) => ({
+  function finalizeAssistant(messageId: string, isError = false) {
+    mutateMessage(messageId, (message: ChatMessage) => ({
       ...message,
       streaming: false,
       status: isError ? 'error' : 'done'
     }))
   }
 
-  function handleChatEvent(agentId: string, messageId: string, event: ChatEvent) {
+  function handleChatEvent(messageId: string, event: ChatEvent) {
     if (event.conversationId) {
-      setConversationId(agentId, event.conversationId)
+      setConversationId(event.conversationId)
     }
     if (event.type === 'token') {
-      mutateMessage(agentId, messageId, (message) => ({
+      mutateMessage(messageId, (message: ChatMessage) => ({
         ...message,
         content: message.content + event.token
       }))
     }
     if (event.type === 'done') {
-      finalizeAssistant(agentId, messageId)
+      finalizeAssistant(messageId)
       setActiveStream(null)
+      resolveResponse(messageId)
+      const nextConversationId = conversationState().conversationId
+      const completedMessage = findMessageById(messageId)
+      if (nextConversationId && completedMessage?.speakerType === 'agent') {
+        queueAgentResponses(completedMessage, nextConversationId)
+      }
     }
     if (event.type === 'error') {
       setChatError(event.message)
-      finalizeAssistant(agentId, messageId, true)
+      finalizeAssistant(messageId, true)
       setActiveStream(null)
+      resolveResponse(messageId)
     }
   }
 
@@ -208,19 +457,20 @@ const App = () => {
     if (!stream) return
     stream.cancel()
     if (markError) {
-      finalizeAssistant(stream.agentId, stream.messageId, true)
+      finalizeAssistant(stream.messageId, true)
     }
     setActiveStream(null)
+    resolveResponse(stream.messageId)
+  }
+
+  function cancelAllResponses(markError: boolean) {
+    stopActiveStream(markError)
+    resetResponseQueue()
   }
 
   function handleClearConversation() {
-    const agentId = selectedAgentId()
-    if (!agentId) return
-    stopActiveStream(true)
-    setConversations((prev: Record<string, ConversationState>) => ({
-      ...prev,
-      [agentId]: { messages: [] }
-    }))
+    cancelAllResponses(true)
+    setConversationState({ messages: [], conversationId: undefined })
   }
 
   function handleMessageKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
@@ -231,37 +481,26 @@ const App = () => {
   }
 
   function handleSendMessage() {
-    const agent = selectedAgent()
     const text = messageInput().trim()
-    if (!agent || !text) return
+    if (!text || activeAgents().length === 0) return
     setChatError(null)
-    stopActiveStream(false)
-    const userMessage: ChatMessage = { id: randomId(), role: 'user', content: text }
-    const assistantId = randomId()
-    const assistantMessage: ChatMessage = {
-      id: assistantId,
-      role: 'assistant',
-      content: '',
-      streaming: true
+    cancelAllResponses(false)
+    const speakerName = personLabel()
+    const conversationId = ensureConversationId()
+    const userMessage: ChatMessage = {
+      id: randomId(),
+      role: 'user',
+      content: text,
+      speakerType: 'person',
+      speakerName,
+      speakerId: PERSON_ID,
     }
-    appendMessages(agent.id, userMessage, assistantMessage)
+    appendMessages(userMessage)
     setMessageInput('')
-    const currentConversation = conversations()[agent.id]
-    const cancel = streamChat({
-      backendUrl: WS_URL,
-      agentId: agent.id,
-      conversationId: currentConversation?.conversationId,
-      message: text,
-      options: { temperature: temperature() },
-      onEvent: (event: ChatEvent) => handleChatEvent(agent.id, assistantId, event)
-    })
-    setActiveStream({ agentId: agent.id, messageId: assistantId, cancel })
+    queueAgentResponses(userMessage, conversationId)
   }
 
-  const isStreaming = () => {
-    const stream = activeStream()
-    return !!stream && stream.agentId === selectedAgentId()
-  }
+  const isStreaming = () => !!activeStream()
 
   const statusToneClass = () => {
     const message = (statusMessage() ?? '').toLowerCase()
@@ -284,23 +523,41 @@ const App = () => {
             New
           </button>
         </div>
-        <p class="mt-1 text-xs text-slate-400">Select an agent or create a new one.</p>
+        <p class="mt-1 text-xs text-slate-400">Toggle agents into the shared conversation and edit their settings.</p>
         <div class="mt-4 space-y-2">
           <For each={agents()}>
-            {(agent: Agent) => (
-              <button
-                class={clsx(
-                  'w-full rounded border px-3 py-2 text-left text-sm transition',
-                  agent.id === selectedAgentId()
-                    ? 'border-emerald-400 bg-emerald-500/10'
-                    : 'border-transparent bg-slate-800 hover:bg-slate-800/80'
-                )}
-                onClick={() => setSelectedAgentId(agent.id)}
-              >
-                <div class="font-semibold">{agent.name}</div>
-                <div class="text-xs text-slate-400">{agent.id}</div>
-              </button>
-            )}
+            {(agent: Agent) => {
+              const active = () => isAgentActive(agent.id)
+              return (
+                <div class="flex items-center gap-2">
+                  <button
+                    class={clsx(
+                      'flex-1 rounded border px-3 py-2 text-left text-sm transition',
+                      agent.id === selectedAgentId()
+                        ? 'border-emerald-400 bg-emerald-500/10'
+                        : 'border-transparent bg-slate-800 hover:bg-slate-800/80'
+                    )}
+                    onClick={() => setSelectedAgentId(agent.id)}
+                  >
+                    <div class="font-semibold">{agent.name}</div>
+                    <div class="text-xs text-slate-400">{agent.id}</div>
+                  </button>
+                  <button
+                    class={clsx(
+                      'rounded-full border px-2 py-1 text-sm transition',
+                      active() ? 'border-emerald-400 text-emerald-300' : 'border-slate-700 text-slate-300 hover:border-slate-500'
+                    )}
+                    aria-label={`${active() ? 'Remove' : 'Add'} ${agent.name} ${active() ? 'from' : 'to'} conversation`}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      active() ? removeAgentFromConversation(agent.id) : addAgentToConversation(agent.id)
+                    }}
+                  >
+                    {active() ? '−' : '+'}
+                  </button>
+                </div>
+              )
+            }}
           </For>
           <Show when={loadingAgents()}>
             <div class="text-xs text-slate-400">Loading agents…</div>
@@ -312,7 +569,7 @@ const App = () => {
         <section class="flex flex-1 min-h-0 flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="space-y-1">
-              <h2 class="text-lg font-semibold">Chat · {selectedAgent()?.name ?? 'Select an agent'}</h2>
+              <h2 class="text-lg font-semibold">Chat · {selectedAgent()?.name ?? 'Choose an active agent'}</h2>
               <p class="text-xs text-slate-400">Streaming responses via WebSocket ({WS_URL}).</p>
               <Show when={statusMessage()}>
                 <p class={`text-xs ${statusToneClass()}`}>{statusMessage()}</p>
@@ -337,6 +594,17 @@ const App = () => {
               >
                 Clear Chat
               </button>
+              <div class="flex flex-col gap-1 text-[11px] text-slate-400">
+                <label class="uppercase tracking-wide" for="person-name-input">
+                  Your name
+                </label>
+                <input
+                  id="person-name-input"
+                  class="w-40 rounded-xl border border-slate-700 bg-slate-950/80 px-2 py-1 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
+                  value={personName()}
+                  onInput={(event) => setPersonName(event.currentTarget.value)}
+                />
+              </div>
               <button
                 class="rounded border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-500 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-600"
                 onClick={() => setAgentModalOpen(true)}
@@ -347,17 +615,56 @@ const App = () => {
             </div>
           </div>
 
+          <Show when={activeAgents().length}>
+            <div class="rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs text-slate-400">
+              <p class="mb-2 font-semibold uppercase tracking-wide text-[10px] text-slate-500">Active agents</p>
+              <div class="flex flex-wrap gap-2">
+                <For each={activeAgents()}>
+                  {(agent: Agent) => (
+                    <div
+                      class={clsx(
+                        'flex items-center gap-2 rounded-full border px-3 py-1',
+                        agent.id === selectedAgentId()
+                          ? 'border-emerald-400 bg-emerald-500/10 text-emerald-100'
+                          : 'border-slate-700 bg-slate-900/70 text-slate-200'
+                      )}
+                    >
+                      <button
+                        class="text-xs font-semibold uppercase tracking-wide"
+                        onClick={() => setSelectedAgentId(agent.id)}
+                      >
+                        {agent.name}
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-full border border-slate-700 px-1 text-[10px] text-slate-300 hover:border-slate-500"
+                        aria-label={`Remove ${agent.name} from conversation`}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          removeAgentFromConversation(agent.id)
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+          </Show>
+
           <div class="scroll-container flex-1 min-h-0 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/60 p-4">
             <Show
-              when={selectedAgentId()}
-              fallback={<p class="text-sm text-slate-400">Select an agent to start chatting.</p>}
+              when={activeAgents().length}
+              fallback={<p class="text-sm text-slate-400">Add at least one agent to the conversation to start chatting.</p>}
             >
-              <For each={selectedConversation().messages}>
+              <For each={conversation().messages}>
                 {(message: ChatMessage) => (
                   <div
                     data-testid={`message-${message.role}`}
                     class={clsx('mb-3 flex flex-col gap-1', message.role === 'user' ? 'items-end' : 'items-start')}
                   >
+                    <div class="text-[10px] uppercase tracking-wide text-slate-500">{messageSpeakerLabel(message)}</div>
                     <div
                       class={clsx(
                         'max-w-2xl rounded-2xl px-4 py-2 text-sm',
@@ -398,7 +705,7 @@ const App = () => {
             <div class="flex items-center gap-3">
               <button
                 class="rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700"
-                disabled={!messageInput().trim() || !selectedAgentId()}
+                disabled={!canSendMessage()}
                 onClick={handleSendMessage}
               >
                 Send

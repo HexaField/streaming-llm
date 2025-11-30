@@ -14,6 +14,11 @@ export type StreamChatParams = {
   conversationId?: string;
   message: string;
   options?: ChatOptions;
+  speakerRole?: string;
+  speakerName?: string;
+  speakerId?: string;
+  skipUserAppend?: boolean;
+  promptFromLatest?: boolean;
   onEvent: (event: ChatEvent) => void;
   socketFactory?: (url: string) => WebSocket;
 };
@@ -38,6 +43,11 @@ export function streamChat({
   conversationId,
   message,
   options,
+  speakerRole,
+  speakerName,
+  speakerId,
+  skipUserAppend,
+  promptFromLatest,
   onEvent,
   socketFactory,
 }: StreamChatParams): () => void {
@@ -50,6 +60,11 @@ export function streamChat({
       conversation_id: conversationId,
       user_message: message,
       options,
+      speaker_role: speakerRole,
+      speaker_name: speakerName,
+      speaker_id: speakerId,
+      skip_user_append: skipUserAppend,
+      prompt_from_latest: promptFromLatest,
     };
     socket.send(JSON.stringify(payload));
   };

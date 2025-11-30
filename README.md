@@ -45,6 +45,8 @@ CUDA_VISIBLE_DEVICES=0 python examples/run_streaming_llama.py  --enable_streamin
 
 The FastAPI-based multi-agent demo stores user-editable agent definitions as Markdown files. By default these live in the `.agents/` directory, which is gitignored so local tweaks never appear in commits. Set `STREAMING_LLM_AGENTS_DIR=/path/to/dir` before starting the backend to point at a different location. On first launch the backend will seed two demo agents (`planner` and `researcher`) into the chosen directory if they are missing.
 
+When running the SolidJS demo UI, every agent currently in the “Active agents” list receives the exact same shared conversation context. Each turn records both the participant role (`PERSON`, `AGENT`, etc.) and the speaker name, so adding additional people or agents in the future only requires surfacing new UI controls—the backend already preserves the metadata needed for richer transcripts.
+
 ## FAQ
 
 1. **What does "working on infinite-length inputs" imply for LLMs?**

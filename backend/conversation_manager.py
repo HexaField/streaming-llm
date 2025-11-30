@@ -15,11 +15,26 @@ class ConversationManager:
         self._conversations[new_id] = deque(maxlen=self.max_turns)
         return new_id
 
-    def append(self, conversation_id: str, role: str, content: str) -> None:
+    def append(
+        self,
+        conversation_id: str,
+        role: str,
+        content: str,
+        *,
+        name: Optional[str] = None,
+        speaker_id: Optional[str] = None,
+    ) -> None:
         convo = self._conversations.setdefault(
             conversation_id, deque(maxlen=self.max_turns)
         )
-        convo.append({"role": role, "content": content})
+        convo.append(
+            {
+                "role": role,
+                "name": name,
+                "speaker_id": speaker_id,
+                "content": content,
+            }
+        )
 
     def history(self, conversation_id: str) -> List[Dict[str, str]]:
         convo = self._conversations.get(conversation_id)

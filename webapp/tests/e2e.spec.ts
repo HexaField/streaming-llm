@@ -8,14 +8,14 @@ const chatMessage = `Hello from playwright ${uniqueSuffix}`
 const safeAgentName = agentName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 async function waitForAgentList(page: Page) {
-  await expect(page.getByText(agentName)).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: new RegExp(`^${safeAgentName}`) }).first()).toBeVisible({ timeout: 30_000 })
 }
 
 test.describe('StreamingLLM multi-agent chat', () => {
   test('user can manage agents and stream chat', async ({ page }) => {
     await page.goto('/')
 
-    await expect(page.getByRole('button', { name: /Planner/i })).toBeVisible()
+    await expect(page.getByRole('button', { name: /^Planner/i })).toBeVisible()
 
     await page.getByRole('button', { name: 'New' }).click()
     await page.getByLabel('Agent Name').fill(agentName)
@@ -26,7 +26,8 @@ test.describe('StreamingLLM multi-agent chat', () => {
 
     await page.reload()
     await waitForAgentList(page)
-    await page.getByRole('button', { name: new RegExp(`^${safeAgentName}`) }).click()
+    await page.getByLabel(`Add ${agentName} to conversation`).click()
+    await page.getByRole('button', { name: new RegExp(`^${safeAgentName}`) }).first().click()
 
     const temperatureSlider = page.locator('input[type="range"]')
     await temperatureSlider.fill('0')
