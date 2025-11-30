@@ -37,6 +37,7 @@ const App = () => {
   const [chatError, setChatError] = createSignal<string | null>(null);
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
   const [isSavingAgent, setIsSavingAgent] = createSignal(false);
+  const [isAgentModalOpen, setAgentModalOpen] = createSignal(false);
   const [loadingAgents, setLoadingAgents] = createSignal(false);
   const [activeStream, setActiveStream] = createSignal<
     | {
@@ -65,6 +66,12 @@ const App = () => {
     const agent = selectedAgent();
     if (agent && !draftAgents[agent.id]) {
       setDraftAgents(agent.id, { ...agent });
+    }
+  });
+
+  createEffect(() => {
+    if (!selectedAgentId()) {
+      setAgentModalOpen(false);
     }
   });
 
@@ -142,6 +149,7 @@ const App = () => {
     setDraftAgents(id, { ...template });
     setSelectedAgentId(id);
     setStatusMessage("New agent ready. Save to persist.");
+    setAgentModalOpen(true);
   }
 
   function updateConversation(agentId: string, builder: (state: ConversationState) => ConversationState) {
@@ -227,6 +235,13 @@ const App = () => {
     }));
   }
 
+  function handleMessageKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
+    if (event.key === "Enter" && !(event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      handleSendMessage();
+    }
+  }
+
   function handleSendMessage() {
     const agent = selectedAgent();
     const text = messageInput().trim();
@@ -260,9 +275,18 @@ const App = () => {
     return !!stream && stream.agentId === selectedAgentId();
   };
 
+  const statusToneClass = () => {
+    const message = (statusMessage() ?? "").toLowerCase();
+    if (!message) return "text-slate-400";
+    if (message.includes("fail") || message.includes("error")) {
+      return "text-rose-300";
+    }
+    return "text-emerald-300";
+  };
+
   return (
-    <div class="flex min-h-screen bg-slate-950 text-slate-100">
-      <aside class="w-64 border-r border-slate-800 bg-slate-900/70 p-4">
+    <div class="flex h-screen overflow-hidden bg-slate-950 text-slate-100">
+      <aside class="w-64 border-r border-slate-800 bg-slate-900/70 p-4 overflow-y-auto">
         <div class="flex items-center justify-between">
           <h1 class="text-lg font-semibold">Agents</h1>
           <button
@@ -296,18 +320,21 @@ const App = () => {
         </div>
       </aside>
 
-      <main class="flex flex-1 flex-col gap-6 p-6">
-        <section class="flex flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
-          <div class="flex items-center justify-between">
-            <div>
+      <main class="flex flex-1 min-h-0 flex-col gap-6 overflow-hidden p-6">
+        <section class="flex flex-1 min-h-0 flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="space-y-1">
               <h2 class="text-lg font-semibold">
                 Chat · {selectedAgent()?.name ?? "Select an agent"}
               </h2>
               <p class="text-xs text-slate-400">
                 Streaming responses via WebSocket ({WS_URL}).
               </p>
+              <Show when={statusMessage()}>
+                <p class={`text-xs ${statusToneClass()}`}>{statusMessage()}</p>
+              </Show>
             </div>
-            <div class="flex items-center gap-2 text-xs text-slate-400">
+            <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
               <label class="flex items-center gap-2">
                 Temp
                 <input
@@ -328,10 +355,17 @@ const App = () => {
               >
                 Clear Chat
               </button>
+              <button
+                class="rounded border border-slate-700 px-3 py-1 text-xs text-slate-200 hover:border-slate-500 disabled:cursor-not-allowed disabled:border-slate-800 disabled:text-slate-600"
+                onClick={() => setAgentModalOpen(true)}
+                disabled={!selectedAgentId()}
+              >
+                Agent Settings
+              </button>
             </div>
           </div>
 
-          <div class="h-96 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/60 p-4 scroll-container">
+          <div class="scroll-container flex-1 min-h-0 overflow-y-auto rounded-xl border border-slate-800 bg-slate-950/60 p-4">
             <Show when={selectedAgentId()} fallback={<p class="text-sm text-slate-400">Select an agent to start chatting.</p>}>
               <For each={selectedConversation().messages}>
                 {(message: ChatMessage) => (
@@ -379,6 +413,7 @@ const App = () => {
               placeholder="Send a message…"
               value={messageInput()}
               onInput={(event) => setMessageInput(event.currentTarget.value)}
+              onKeyDown={handleMessageKeyDown}
             />
             <div class="flex items-center gap-3">
               <button
@@ -400,56 +435,74 @@ const App = () => {
           </div>
         </section>
 
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
-          <h2 class="text-lg font-semibold">Agent settings</h2>
-          <p class="text-xs text-slate-400">System prompt + markdown context get stored on the backend.</p>
-          <Show when={selectedAgentId()} fallback={<p class="mt-4 text-sm text-slate-400">Select or create an agent to edit settings.</p>}>
-            <div class="mt-5 space-y-4 text-sm">
-              <div class="flex flex-col gap-1">
-                <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-name-input">Agent Name</label>
-                <input
-                  id="agent-name-input"
-                  class="rounded-xl border border-slate-700 bg-slate-950/80 p-2"
-                  value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.name ?? "" : ""}
-                  onInput={(event) => handleDraftChange("name", event.currentTarget.value)}
-                />
-              </div>
-              <div class="flex flex-col gap-1">
-                <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-system-prompt">System Prompt</label>
-                <textarea
-                  id="agent-system-prompt"
-                  rows={3}
-                  class="rounded-xl border border-slate-700 bg-slate-950/80 p-2"
-                  value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.system_prompt ?? "" : ""}
-                  onInput={(event) => handleDraftChange("system_prompt", event.currentTarget.value)}
-                />
-              </div>
-              <div class="flex flex-col gap-1">
-                <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-markdown-context">Markdown Context</label>
-                <textarea
-                  id="agent-markdown-context"
-                  rows={10}
-                  class="rounded-xl border border-slate-700 bg-slate-950/80 p-2 font-mono"
-                  value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.markdown_context ?? "" : ""}
-                  onInput={(event) => handleDraftChange("markdown_context", event.currentTarget.value)}
-                />
-              </div>
-              <div class="flex items-center gap-3">
-                <button
-                  class="rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700"
-                  disabled={!selectedAgentId() || isSavingAgent()}
-                  onClick={handleSaveAgent}
-                >
-                  {isSavingAgent() ? "Saving…" : "Save"}
-                </button>
-                <Show when={statusMessage()}>
-                  <span class="text-xs text-slate-400">{statusMessage()}</span>
-                </Show>
-              </div>
-            </div>
-          </Show>
-        </section>
       </main>
+
+      <Show when={isAgentModalOpen()}>
+        <div
+          class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4"
+          onClick={() => setAgentModalOpen(false)}
+        >
+          <div
+            class="w-full max-w-3xl rounded-2xl border border-slate-800 bg-slate-900/90 p-6 text-sm text-slate-100"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div class="flex items-center justify-between">
+              <div>
+                <h2 class="text-xl font-semibold">Agent settings</h2>
+                <p class="text-xs text-slate-400">System prompt + markdown context get stored on the backend.</p>
+              </div>
+              <button
+                class="rounded-xl border border-slate-700 px-3 py-1 text-xs text-slate-300 hover:border-slate-500"
+                onClick={() => setAgentModalOpen(false)}
+              >
+                Close
+              </button>
+            </div>
+            <Show when={selectedAgentId()} fallback={<p class="mt-6 text-sm text-slate-400">Select or create an agent to edit settings.</p>}>
+              <div class="mt-6 space-y-4">
+                <div class="flex flex-col gap-1">
+                  <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-name-input">Agent Name</label>
+                  <input
+                    id="agent-name-input"
+                    class="rounded-xl border border-slate-700 bg-slate-950/80 p-2"
+                    value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.name ?? "" : ""}
+                    onInput={(event) => handleDraftChange("name", event.currentTarget.value)}
+                  />
+                </div>
+                <div class="flex flex-col gap-1">
+                  <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-system-prompt">System Prompt</label>
+                  <textarea
+                    id="agent-system-prompt"
+                    rows={3}
+                    class="rounded-xl border border-slate-700 bg-slate-950/80 p-2"
+                    value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.system_prompt ?? "" : ""}
+                    onInput={(event) => handleDraftChange("system_prompt", event.currentTarget.value)}
+                  />
+                </div>
+                <div class="flex flex-col gap-1">
+                  <label class="text-xs uppercase tracking-wide text-slate-400" for="agent-markdown-context">Markdown Context</label>
+                  <textarea
+                    id="agent-markdown-context"
+                    rows={10}
+                    class="rounded-xl border border-slate-700 bg-slate-950/80 p-2 font-mono"
+                    value={selectedAgentId() ? draftAgents[selectedAgentId()!]?.markdown_context ?? "" : ""}
+                    onInput={(event) => handleDraftChange("markdown_context", event.currentTarget.value)}
+                  />
+                </div>
+                <div class="flex items-center gap-3">
+                  <button
+                    class="rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700"
+                    disabled={!selectedAgentId() || isSavingAgent()}
+                    onClick={handleSaveAgent}
+                  >
+                    {isSavingAgent() ? "Saving…" : "Save"}
+                  </button>
+                </div>
+              </div>
+            </Show>
+          </div>
+        </div>
+      </Show>
     </div>
   );
 };
