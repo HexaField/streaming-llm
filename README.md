@@ -47,6 +47,8 @@ The FastAPI-based multi-agent demo stores user-editable agent definitions as Mar
 
 When running the SolidJS demo UI, every agent currently in the “Active agents” list receives the exact same shared conversation context. Each turn records both the participant role (`PERSON`, `AGENT`, etc.) and the speaker name, so adding additional people or agents in the future only requires surfacing new UI controls—the backend already preserves the metadata needed for richer transcripts.
 
+Conversation history is now durable. Every thread shown in the UI sidebar is saved as JSON inside the `.conversations/` directory (gitignored by default) and automatically restored after restarting the FastAPI server or reloading the browser. Set `STREAMING_LLM_CONVERSATIONS_DIR=/path/to/dir` to keep the archives somewhere else, and adjust `STREAMING_LLM_CONVERSATION_MAX_TURNS` if you want the backend to retain more than the default 200 turns per thread. The UI lets you create, rename, delete, and switch between these persisted conversations; each active agent keeps responding with the full shared history regardless of which conversation is currently in focus.
+
 ## FAQ
 
 1. **What does "working on infinite-length inputs" imply for LLMs?**

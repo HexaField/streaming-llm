@@ -169,3 +169,6 @@ webapp/playwright-report/
 
 # Local agent definitions (configurable via STREAMING_LLM_AGENTS_DIR)
 .agents/
+
+# Persisted conversation archives (configurable via STREAMING_LLM_CONVERSATIONS_DIR)
+.conversations/

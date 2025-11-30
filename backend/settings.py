@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 
 DEFAULT_AGENTS_DIR = Path(".agents")
+DEFAULT_CONVERSATIONS_DIR = Path(".conversations")
 
 
 class Settings(BaseModel):
@@ -16,6 +17,12 @@ class Settings(BaseModel):
     recent_size: int = int(os.environ.get("STREAMING_LLM_RECENT_SIZE", "2048"))
     agents_dir: Path = Path(
         os.environ.get("STREAMING_LLM_AGENTS_DIR") or DEFAULT_AGENTS_DIR
+    )
+    conversations_dir: Path = Path(
+        os.environ.get("STREAMING_LLM_CONVERSATIONS_DIR") or DEFAULT_CONVERSATIONS_DIR
+    )
+    conversation_max_turns: int = int(
+        os.environ.get("STREAMING_LLM_CONVERSATION_MAX_TURNS", "200")
     )
     max_new_tokens: int = int(os.environ.get("STREAMING_LLM_MAX_NEW_TOKENS", "512"))
     ollama_base_url: str = os.environ.get(

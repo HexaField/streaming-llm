@@ -1,10 +1,32 @@
-import { listAgents, streamChat, updateAgent, type Agent, type ChatEvent } from '@ts-client/client'
+import {
+  Agent,
+  ConversationDetail,
+  ConversationMessage,
+  ConversationSummary,
+  createConversation,
+  deleteConversation,
+  getConversation,
+  listAgents,
+  listConversations,
+  renameConversation,
+  sendConversationMessage,
+  updateAgent,
+  updateConversationAgents,
+} from '@ts-client/client'
 import clsx from 'clsx'
-import { For, Show, createEffect, createSignal, onMount } from 'solid-js'
+import { For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
 import { createStore } from 'solid-js/store'
 
-const HTTP_BASE = import.meta.env.VITE_BACKEND_HTTP ?? 'http://localhost:8000'
-const WS_URL = import.meta.env.VITE_BACKEND_WS ?? 'ws://localhost:8000/ws/chat'
+const HTTP_BASE =
+  import.meta.env.VITE_BACKEND_HTTP ?? import.meta.env.VITE_BACKEND ?? 'http://localhost:8000'
+const RAW_WS_URL = import.meta.env.VITE_BACKEND_WS ?? 'ws://localhost:8000/ws/chat'
+const WS_ROOT = RAW_WS_URL.replace(/\/ws\/chat$/, '')
+const PERSON_ROLE = 'PERSON'
+const PERSON_ID = 'person-local'
+
+const conversationWsUrl = (conversationId: string) => `${WS_ROOT}/ws/conversations/${conversationId}`
+
+const randomId = () => Math.random().toString(36).slice(2)
 
 type SpeakerType = 'person' | 'agent'
 
@@ -13,7 +35,7 @@ type ChatMessage = {
   role: 'user' | 'assistant'
   content: string
   streaming?: boolean
-  status?: 'done' | 'error'
+  status?: 'pending' | 'done' | 'error'
   agentId?: string
   speakerType: SpeakerType
   speakerName?: string
@@ -22,22 +44,23 @@ type ChatMessage = {
 
 type ConversationState = {
   conversationId?: string
+  title?: string
   messages: ChatMessage[]
 }
 
-const randomId = () => Math.random().toString(36).slice(2)
-const PERSON_ROLE = 'PERSON'
-const PERSON_ID = 'person-local'
-const RESPONSE_DELAY_MS = 600
-const RESPONSE_DELAY_STEP_MS = 200
-
-type ResponseTask = {
-  agentId: string
-  conversationId: string
-  trigger: ChatMessage
-  skipUserAppend: boolean
-  promptFromLatest: boolean
-  delayMs: number
+const mapConversationMessage = (message: ConversationMessage): ChatMessage => {
+  const normalizedRole = (message.role || '').toUpperCase()
+  const speakerType: SpeakerType = normalizedRole === 'AGENT' ? 'agent' : 'person'
+  return {
+    id: message.id || randomId(),
+    role: speakerType === 'agent' ? 'assistant' : 'user',
+    content: message.content ?? '',
+    speakerType,
+    speakerName: message.name,
+    speakerId: message.speaker_id,
+    agentId: speakerType === 'agent' ? message.speaker_id : undefined,
+    status: 'done',
+  }
 }
 
 const App = () => {
@@ -47,6 +70,8 @@ const App = () => {
   const [conversationState, setConversationState] = createSignal<ConversationState>({
     messages: [],
   })
+  const [conversationSummaries, setConversationSummaries] = createSignal<ConversationSummary[]>([])
+  const [isLoadingConversations, setIsLoadingConversations] = createSignal(false)
   const [activeAgentIds, setActiveAgentIds] = createSignal<string[]>([])
   const [messageInput, setMessageInput] = createSignal('')
   const [personName, setPersonName] = createSignal('You')
@@ -56,24 +81,22 @@ const App = () => {
   const [isSavingAgent, setIsSavingAgent] = createSignal(false)
   const [isAgentModalOpen, setAgentModalOpen] = createSignal(false)
   const [loadingAgents, setLoadingAgents] = createSignal(false)
-  const [activeStream, setActiveStream] = createSignal<{
-    agentId: string
-    messageId: string
-    cancel: () => void
-  } | null>(null)
-  const pendingResponseResolvers = new Map<string, () => void>()
-  const queuedResponseAgents = new Set<string>()
-  let responseQueue: ResponseTask[] = []
-  let responseQueueProcessing = false
-  let responseQueueToken = 0
+  const [socketStatus, setSocketStatus] = createSignal<'disconnected' | 'connecting' | 'connected'>('disconnected')
 
+  let conversationSocket: WebSocket | null = null
+  let socketReconnectTimer: number | undefined
+  let socketConversationId: string | undefined
   const selectedAgent = () => agents().find((agent: Agent) => agent.id === selectedAgentId())
   const personLabel = () => personName().trim() || 'You'
-
   const conversation = () => conversationState()
 
-  const findMessageById = (messageId: string) =>
-    conversationState().messages.find((message) => message.id === messageId)
+  const canSendMessage = () => {
+    if (!messageInput().trim()) return false
+    if (!conversationState().conversationId) return false
+    return true
+  }
+
+  const isStreaming = () => conversationState().messages.some((message) => message.streaming)
 
   const activeAgents = () =>
     activeAgentIds()
@@ -100,21 +123,19 @@ const App = () => {
     return message.role === 'user' ? 'You' : 'Assistant'
   }
 
-  const canSendMessage = () => {
-    if (!messageInput().trim()) return false
-    return activeAgents().length > 0
+  const sortConversationSummaries = (list: ConversationSummary[]) => {
+    const parseTime = (value?: string) => (value ? Date.parse(value) : 0)
+    return [...list].sort((a, b) => parseTime(b.updated_at) - parseTime(a.updated_at))
   }
 
-  onMount(() => {
-    refreshAgents()
-  })
-
-  createEffect(() => {
-    const agent = selectedAgent()
-    if (agent && !draftAgents[agent.id]) {
-      setDraftAgents(agent.id, { ...agent })
-    }
-  })
+  function upsertConversationSummary(summary: ConversationSummary) {
+    setConversationSummaries((prev) =>
+      sortConversationSummaries([
+        ...prev.filter((item) => item.id !== summary.id),
+        summary,
+      ]),
+    )
+  }
 
   createEffect(() => {
     if (!selectedAgentId()) {
@@ -122,182 +143,155 @@ const App = () => {
     }
   })
 
-  function updateActiveAgents(updater: (prev: string[]) => string[]) {
-    setActiveAgentIds((prev: string[]) => {
-      const next = updater(prev)
-      if (!next.length) {
-        setSelectedAgentId(undefined)
+  function updateSummaryWithMessage(conversationId: string | undefined, content: string) {
+    if (!conversationId || !content.trim()) return
+    const preview = content.slice(0, 160)
+    setConversationSummaries((prev) => {
+      const index = prev.findIndex((item) => item.id === conversationId)
+      if (index === -1) {
+        const fallback: ConversationSummary = {
+          id: conversationId,
+          title: conversationState().title ?? `Conversation ${conversationId.slice(0, 8)}`,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          message_count: 1,
+          last_message_preview: preview,
+          active_agents: activeAgentIds(),
+        }
+        return sortConversationSummaries([...prev, fallback])
+      }
+      const clone = [...prev]
+      const summary = clone[index]
+      clone[index] = {
+        ...summary,
+        updated_at: new Date().toISOString(),
+        last_message_preview: preview,
+        message_count: summary.message_count + 1,
+        active_agents: activeAgentIds(),
+      }
+      return sortConversationSummaries(clone)
+    })
+  }
+
+  function appendMessages(...messages: ChatMessage[]) {
+    setConversationState((prev) => {
+      const existing = new Map(prev.messages.map((message) => [message.id, message]))
+      const nextMessages = [...prev.messages]
+      messages.forEach((message) => {
+        if (existing.has(message.id)) {
+          const index = nextMessages.findIndex((item) => item.id === message.id)
+          if (index >= 0) {
+            nextMessages[index] = { ...nextMessages[index], ...message }
+          }
+        } else {
+          nextMessages.push(message)
+        }
+      })
+      return { ...prev, messages: nextMessages }
+    })
+  }
+
+  function mutateMessage(messageId: string, transform: (message: ChatMessage) => ChatMessage) {
+    setConversationState((prev) => ({
+      ...prev,
+      messages: prev.messages.map((message) => (message.id === messageId ? transform(message) : message)),
+    }))
+  }
+
+  function applyConversationDetail(detail: ConversationDetail) {
+    const normalized = detail.messages.map(mapConversationMessage)
+    setConversationState({
+      conversationId: detail.id,
+      title: detail.title,
+      messages: normalized,
+    })
+    setActiveAgentIds(detail.active_agents ?? [])
+    upsertConversationSummary(detail)
+    setMessageInput('')
+  }
+
+  async function initializeConversations() {
+    setIsLoadingConversations(true)
+    try {
+      const summaries = await listConversations(HTTP_BASE)
+      setConversationSummaries(sortConversationSummaries(summaries))
+      if (summaries.length) {
+        await openConversation(summaries[0].id, { silent: true })
       } else {
-        const current = selectedAgentId()
-        if (!current || !next.includes(current)) {
-          setSelectedAgentId(next[0])
+        const detail = await createConversation({}, HTTP_BASE)
+        applyConversationDetail(detail)
+      }
+    } catch (err) {
+      setStatusMessage(`Failed to load conversations: ${(err as Error).message}`)
+    } finally {
+      setIsLoadingConversations(false)
+    }
+  }
+
+  async function openConversation(conversationId: string, options: { silent?: boolean } = {}) {
+    if (!conversationId) return
+    if (!options.silent) {
+      setIsLoadingConversations(true)
+    }
+    try {
+      const detail = await getConversation(conversationId, HTTP_BASE)
+      applyConversationDetail(detail)
+    } catch (err) {
+      setStatusMessage(`Failed to load conversation: ${(err as Error).message}`)
+    } finally {
+      if (!options.silent) {
+        setIsLoadingConversations(false)
+      }
+    }
+  }
+
+  async function handleCreateConversation(title?: string) {
+    setIsLoadingConversations(true)
+    try {
+      const detail = await createConversation(title ? { title } : {}, HTTP_BASE)
+      applyConversationDetail(detail)
+    } catch (err) {
+      setStatusMessage(`Failed to create conversation: ${(err as Error).message}`)
+    } finally {
+      setIsLoadingConversations(false)
+    }
+  }
+
+  async function handleRenameConversation(conversationId: string) {
+    const current = conversationSummaries().find((item) => item.id === conversationId)
+    const nextTitle = window.prompt('Rename conversation', current?.title ?? 'Conversation')
+    if (nextTitle === null) return
+    try {
+      const detail = await renameConversation(conversationId, { title: nextTitle }, HTTP_BASE)
+      upsertConversationSummary(detail)
+      if (conversationState().conversationId === conversationId) {
+        setConversationState((prev) => ({ ...prev, title: detail.title }))
+      }
+    } catch (err) {
+      setStatusMessage(`Failed to rename conversation: ${(err as Error).message}`)
+    }
+  }
+
+  async function handleDeleteConversation(conversationId: string) {
+    if (!window.confirm('Delete this conversation?')) return
+    setIsLoadingConversations(true)
+    try {
+      await deleteConversation(conversationId, HTTP_BASE)
+      const remaining = conversationSummaries().filter((item) => item.id !== conversationId)
+      setConversationSummaries(remaining)
+      if (conversationState().conversationId === conversationId) {
+        setConversationState({ conversationId: undefined, title: undefined, messages: [] })
+        if (remaining.length) {
+          await openConversation(remaining[0].id, { silent: true })
+        } else {
+          await handleCreateConversation()
         }
       }
-      return next
-    })
-  }
-
-  function addAgentToConversation(agentId: string) {
-    updateActiveAgents((prev) => (prev.includes(agentId) ? prev : [...prev, agentId]))
-    setSelectedAgentId(agentId)
-  }
-
-  function removeAgentFromConversation(agentId: string) {
-    updateActiveAgents((prev) => prev.filter((id) => id !== agentId))
-    const stream = activeStream()
-    if (stream?.agentId === agentId) {
-      stopActiveStream(true)
+    } catch (err) {
+      setStatusMessage(`Failed to delete conversation: ${(err as Error).message}`)
+    } finally {
+      setIsLoadingConversations(false)
     }
-  }
-
-  function ensureConversationId(): string {
-    const existing = conversationState().conversationId
-    if (existing) {
-      return existing
-    }
-    const generated =
-      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `conversation-${Date.now().toString(36)}-${randomId()}`
-    setConversationState((prev) => ({ conversationId: generated, messages: [...prev.messages] }))
-    return generated
-  }
-
-  function resetResponseQueue() {
-    responseQueue = []
-    responseQueueToken += 1
-    responseQueueProcessing = false
-    queuedResponseAgents.clear()
-  }
-
-  function enqueueResponseTasks(tasks: ResponseTask[]) {
-    const eligible = tasks.filter((task) => !queuedResponseAgents.has(task.agentId))
-    if (!eligible.length) return
-    eligible.forEach((task) => queuedResponseAgents.add(task.agentId))
-    responseQueue = [...responseQueue, ...eligible]
-    void processResponseQueue(responseQueueToken)
-  }
-
-  async function processResponseQueue(token: number) {
-    if (responseQueueProcessing) return
-    responseQueueProcessing = true
-    while (responseQueue.length && token === responseQueueToken) {
-      const task = responseQueue[0]
-      await waitMs(task.delayMs)
-      if (token !== responseQueueToken) {
-        break
-      }
-      await runResponseTask(task)
-      if (token !== responseQueueToken) {
-        break
-      }
-      responseQueue = responseQueue.slice(1)
-    }
-    responseQueueProcessing = false
-    if (responseQueue.length) {
-      void processResponseQueue(responseQueueToken)
-    }
-  }
-
-  function waitMs(ms: number) {
-    return new Promise<void>((resolve) => {
-      setTimeout(resolve, ms)
-    })
-  }
-
-  function resolveResponse(messageId: string) {
-    const resolver = pendingResponseResolvers.get(messageId)
-    if (resolver) {
-      resolver()
-      pendingResponseResolvers.delete(messageId)
-    }
-    const message = findMessageById(messageId)
-    if (message?.agentId) {
-      queuedResponseAgents.delete(message.agentId)
-    }
-  }
-
-  function queueAgentResponses(message: ChatMessage, conversationId: string) {
-    const availableAgents = [...activeAgentIds()]
-    if (!availableAgents.length) {
-      return
-    }
-    const speakerAgentId =
-      message.speakerType === 'agent' ? message.agentId ?? message.speakerId : undefined
-    let targets = availableAgents.filter((agentId) => agentId !== speakerAgentId)
-    if (!targets.length) {
-      return
-    }
-    if (message.speakerType === 'person') {
-      const preferred = selectedAgentId()
-      if (preferred && targets.includes(preferred)) {
-        targets = targets.filter((agentId) => agentId !== preferred)
-        targets.unshift(preferred)
-      }
-    }
-    const tasks: ResponseTask[] = targets.map((agentId, index) => ({
-      agentId,
-      conversationId,
-      trigger: message,
-      skipUserAppend: message.speakerType === 'person' ? index !== 0 : true,
-      promptFromLatest: message.speakerType === 'person' ? index !== 0 : true,
-      delayMs: RESPONSE_DELAY_MS + index * RESPONSE_DELAY_STEP_MS,
-    }))
-    enqueueResponseTasks(tasks)
-  }
-
-  function runResponseTask(task: ResponseTask): Promise<void> {
-    return new Promise((resolve) => {
-      const agent = agents().find((item: Agent) => item.id === task.agentId)
-      if (!agent || !isAgentActive(agent.id)) {
-        queuedResponseAgents.delete(task.agentId)
-        resolve()
-        return
-      }
-      const assistantId = randomId()
-      const assistantMessage: ChatMessage = {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
-        streaming: true,
-        agentId: agent.id,
-        speakerType: 'agent',
-        speakerName: agent.name,
-        speakerId: agent.id,
-      }
-      appendMessages(assistantMessage)
-      try {
-        const cancel = streamChat({
-          backendUrl: WS_URL,
-          agentId: agent.id,
-          conversationId: task.conversationId,
-          message: task.trigger.content,
-          speakerRole: task.trigger.speakerType === 'person' ? PERSON_ROLE : 'AGENT',
-          speakerName:
-            task.trigger.speakerName ??
-            (task.trigger.speakerType === 'person' ? personLabel() : agent.name),
-          speakerId:
-            task.trigger.speakerType === 'person'
-              ? task.trigger.speakerId ?? PERSON_ID
-              : task.trigger.agentId ?? task.trigger.speakerId ?? agent.id,
-          skipUserAppend: task.skipUserAppend,
-          promptFromLatest: task.promptFromLatest,
-          options: { temperature: temperature() },
-          onEvent: (event: ChatEvent) => handleChatEvent(assistantId, event)
-        })
-        pendingResponseResolvers.set(assistantId, resolve)
-        setActiveStream({ agentId: agent.id, messageId: assistantId, cancel })
-      } catch (err) {
-        mutateMessage(assistantId, (message) => ({
-          ...message,
-          streaming: false,
-          status: 'error',
-        }))
-        setChatError((err as Error).message)
-        queuedResponseAgents.delete(agent.id)
-        resolve()
-      }
-    })
   }
 
   async function refreshAgents() {
@@ -326,19 +320,49 @@ const App = () => {
     }
   }
 
+  async function persistActiveAgents(next: string[]) {
+    const conversationId = conversationState().conversationId
+    if (!conversationId) return
+    try {
+      const detail = await updateConversationAgents(conversationId, next, HTTP_BASE)
+      setActiveAgentIds(detail.active_agents ?? [])
+      upsertConversationSummary(detail)
+    } catch (err) {
+      setStatusMessage(`Failed to update active agents: ${(err as Error).message}`)
+    }
+  }
+
+  function addAgentToConversation(agentId: string) {
+    if (activeAgentIds().includes(agentId)) return
+    const next = [...activeAgentIds(), agentId]
+    setActiveAgentIds(next)
+    setSelectedAgentId(agentId)
+    void persistActiveAgents(next)
+  }
+
+  function removeAgentFromConversation(agentId: string) {
+    const next = activeAgentIds().filter((id) => id !== agentId)
+    setActiveAgentIds(next)
+    if (selectedAgentId() === agentId) {
+      setSelectedAgentId(next[0])
+    }
+    void persistActiveAgents(next)
+  }
+
   function handleDraftChange(field: keyof Agent, value: string) {
     const agentId = selectedAgentId()
     if (!agentId) return
-    const fallback = draftAgents[agentId] ??
+    const fallback =
+      draftAgents[agentId] ??
       selectedAgent() ?? {
         id: agentId,
         name: '',
         system_prompt: '',
-        markdown_context: ''
+        markdown_context: '',
       }
     setDraftAgents(agentId, {
       ...fallback,
-      [field]: value
+      [field]: value,
     } as Agent)
   }
 
@@ -376,7 +400,7 @@ const App = () => {
       id,
       name: 'New Agent',
       system_prompt: 'You are a helpful collaborator.',
-      markdown_context: '# Context\n- Add markdown knowledge here.\n'
+      markdown_context: '# Context\n- Add markdown knowledge here.\n',
     }
     setAgents((prev: Agent[]) => [...prev, template])
     setDraftAgents(id, { ...template })
@@ -385,124 +409,44 @@ const App = () => {
     setAgentModalOpen(true)
   }
 
-  function updateConversation(builder: (state: ConversationState) => ConversationState) {
-    setConversationState((prev: ConversationState) => {
-      const nextState = builder({
-        conversationId: prev.conversationId,
-        messages: [...prev.messages]
-      })
-      return nextState
-    })
-  }
-
-  function appendMessages(...messages: ChatMessage[]) {
-    updateConversation((state) => ({
-      conversationId: state.conversationId,
-      messages: [...state.messages, ...messages]
-    }))
-  }
-
-  function mutateMessage(messageId: string, transform: (message: ChatMessage) => ChatMessage) {
-    updateConversation((state) => ({
-      ...state,
-      messages: state.messages.map((message) => (message.id === messageId ? transform(message) : message))
-    }))
-  }
-
-  function setConversationId(conversationId: string | undefined) {
-    updateConversation((state) => ({
-      ...state,
-      conversationId: conversationId ?? state.conversationId
-    }))
-  }
-
-  function finalizeAssistant(messageId: string, isError = false) {
-    mutateMessage(messageId, (message: ChatMessage) => ({
-      ...message,
-      streaming: false,
-      status: isError ? 'error' : 'done'
-    }))
-  }
-
-  function handleChatEvent(messageId: string, event: ChatEvent) {
-    if (event.conversationId) {
-      setConversationId(event.conversationId)
+  async function handleSendMessage() {
+    const text = messageInput().trim()
+    if (!text) return
+    const conversationId = conversationState().conversationId
+    if (!conversationId) {
+      setStatusMessage('Select or create a conversation to begin chatting.')
+      return
     }
-    if (event.type === 'token') {
-      mutateMessage(messageId, (message: ChatMessage) => ({
-        ...message,
-        content: message.content + event.token
-      }))
+    setChatError(null)
+    const speakerName = personLabel()
+    try {
+      const response = await sendConversationMessage(
+        conversationId,
+        {
+          content: text,
+          speaker_role: PERSON_ROLE,
+          speaker_name: speakerName,
+          speaker_id: PERSON_ID,
+        },
+        HTTP_BASE,
+      )
+      const mapped = mapConversationMessage(response)
+      appendMessages(mapped)
+      updateSummaryWithMessage(conversationId, mapped.content)
+      setMessageInput('')
+    } catch (err) {
+      setChatError((err as Error).message)
     }
-    if (event.type === 'done') {
-      finalizeAssistant(messageId)
-      setActiveStream(null)
-      resolveResponse(messageId)
-      const nextConversationId = conversationState().conversationId
-      const completedMessage = findMessageById(messageId)
-      if (nextConversationId && completedMessage?.speakerType === 'agent') {
-        queueAgentResponses(completedMessage, nextConversationId)
-      }
-    }
-    if (event.type === 'error') {
-      setChatError(event.message)
-      finalizeAssistant(messageId, true)
-      setActiveStream(null)
-      resolveResponse(messageId)
-    }
-  }
-
-  function stopActiveStream(markError = false) {
-    const stream = activeStream()
-    if (!stream) return
-    stream.cancel()
-    if (markError) {
-      finalizeAssistant(stream.messageId, true)
-    }
-    setActiveStream(null)
-    resolveResponse(stream.messageId)
-  }
-
-  function cancelAllResponses(markError: boolean) {
-    stopActiveStream(markError)
-    resetResponseQueue()
-  }
-
-  function handleClearConversation() {
-    cancelAllResponses(true)
-    setConversationState({ messages: [], conversationId: undefined })
   }
 
   function handleMessageKeyDown(event: KeyboardEvent & { currentTarget: HTMLTextAreaElement }) {
     if (event.key === 'Enter' && !(event.metaKey || event.ctrlKey)) {
       event.preventDefault()
-      handleSendMessage()
+      void handleSendMessage()
     }
   }
 
-  function handleSendMessage() {
-    const text = messageInput().trim()
-    if (!text || activeAgents().length === 0) return
-    setChatError(null)
-    cancelAllResponses(false)
-    const speakerName = personLabel()
-    const conversationId = ensureConversationId()
-    const userMessage: ChatMessage = {
-      id: randomId(),
-      role: 'user',
-      content: text,
-      speakerType: 'person',
-      speakerName,
-      speakerId: PERSON_ID,
-    }
-    appendMessages(userMessage)
-    setMessageInput('')
-    queueAgentResponses(userMessage, conversationId)
-  }
-
-  const isStreaming = () => !!activeStream()
-
-  const statusToneClass = () => {
+  function statusToneClass() {
     const message = (statusMessage() ?? '').toLowerCase()
     if (!message) return 'text-slate-400'
     if (message.includes('fail') || message.includes('error')) {
@@ -511,57 +455,279 @@ const App = () => {
     return 'text-emerald-300'
   }
 
+  function cleanupSocket() {
+    if (socketReconnectTimer) {
+      clearTimeout(socketReconnectTimer)
+      socketReconnectTimer = undefined
+    }
+    if (conversationSocket) {
+      conversationSocket.close()
+      conversationSocket = null
+    }
+    socketConversationId = undefined
+    setSocketStatus('disconnected')
+  }
+
+  const socketUrlHint = () => {
+    const base = `${WS_ROOT}/ws/conversations`
+    const currentId = conversationState().conversationId
+    return currentId ? `${base}/${currentId}` : `${base}/:id`
+  }
+
+  function handleSocketEvent(event: MessageEvent) {
+    try {
+      const payload = JSON.parse(event.data)
+      const currentId = conversationState().conversationId
+      if (payload.conversation_id && payload.conversation_id !== currentId) {
+        return
+      }
+      switch (payload.type) {
+        case 'ready':
+          setSocketStatus('connected')
+          break
+        case 'message_appended':
+          if (payload.message) {
+            const mapped = mapConversationMessage(payload.message as ConversationMessage)
+            appendMessages(mapped)
+            updateSummaryWithMessage(currentId, mapped.content)
+          }
+          break
+        case 'message_started':
+          appendMessages({
+            id: payload.message_id ?? randomId(),
+            role: 'assistant',
+            content: '',
+            streaming: true,
+            status: 'pending',
+            agentId: payload.agent_id,
+            speakerType: 'agent',
+            speakerName: payload.speaker_name,
+            speakerId: payload.agent_id,
+          })
+          break
+        case 'token':
+          if (payload.message_id && typeof payload.token === 'string') {
+            mutateMessage(payload.message_id, (message) => ({
+              ...message,
+              content: (message.content ?? '') + payload.token,
+              streaming: true,
+              status: 'pending',
+            }))
+          }
+          break
+        case 'message_completed':
+          if (payload.message_id) {
+            mutateMessage(payload.message_id, (message) => ({
+              ...message,
+              content: payload.content ?? message.content,
+              streaming: false,
+              status: 'done',
+            }))
+          }
+          break
+        case 'message_error':
+          if (payload.message_id) {
+            mutateMessage(payload.message_id, (message) => ({
+              ...message,
+              streaming: false,
+              status: 'error',
+            }))
+            setStatusMessage(payload.message ?? 'Agent error')
+          }
+          break
+        case 'error':
+          setStatusMessage(payload.message ?? 'Conversation socket error')
+          break
+        default:
+          break
+      }
+    } catch (err) {
+      setStatusMessage(`Failed to parse conversation event: ${(err as Error).message}`)
+    }
+  }
+
+  function connectConversationSocket(conversationId: string) {
+    if (!conversationId || conversationId === socketConversationId) return
+    cleanupSocket()
+    const url = conversationWsUrl(conversationId)
+    setSocketStatus('connecting')
+    socketConversationId = conversationId
+    try {
+      conversationSocket = new WebSocket(url)
+    } catch (err) {
+      setSocketStatus('disconnected')
+      setStatusMessage(`Failed to connect conversation socket: ${(err as Error).message}`)
+      return
+    }
+    conversationSocket.onopen = () => {
+      setSocketStatus('connected')
+    }
+    conversationSocket.onmessage = handleSocketEvent
+    conversationSocket.onerror = () => {
+      setSocketStatus('disconnected')
+    }
+    conversationSocket.onclose = () => {
+      setSocketStatus('disconnected')
+      if (socketConversationId) {
+        socketReconnectTimer = window.setTimeout(() => {
+          connectConversationSocket(socketConversationId as string)
+        }, 1500)
+      }
+    }
+  }
+
+  onMount(() => {
+    refreshAgents()
+    void initializeConversations()
+  })
+
+  createEffect(() => {
+    const agent = selectedAgent()
+    if (agent && !draftAgents[agent.id]) {
+      setDraftAgents(agent.id, { ...agent })
+    }
+  })
+
+  createEffect(() => {
+    if (!selectedAgentId()) {
+      setAgentModalOpen(false)
+    }
+  })
+
+  createEffect(() => {
+    const conversationId = conversationState().conversationId
+    if (conversationId) {
+      connectConversationSocket(conversationId)
+    } else {
+      cleanupSocket()
+    }
+  })
+
+  onCleanup(() => {
+    cleanupSocket()
+  })
+
   return (
     <div class="flex h-screen overflow-hidden bg-slate-950 text-slate-100">
-      <aside class="w-64 border-r border-slate-800 bg-slate-900/70 p-4 overflow-y-auto">
-        <div class="flex items-center justify-between">
-          <h1 class="text-lg font-semibold">Agents</h1>
-          <button
-            class="rounded bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-900 hover:bg-emerald-400"
-            onClick={handleCreateAgent}
-          >
-            New
-          </button>
-        </div>
-        <p class="mt-1 text-xs text-slate-400">Toggle agents into the shared conversation and edit their settings.</p>
-        <div class="mt-4 space-y-2">
-          <For each={agents()}>
-            {(agent: Agent) => {
-              const active = () => isAgentActive(agent.id)
-              return (
-                <div class="flex items-center gap-2">
-                  <button
-                    class={clsx(
-                      'flex-1 rounded border px-3 py-2 text-left text-sm transition',
-                      agent.id === selectedAgentId()
-                        ? 'border-emerald-400 bg-emerald-500/10'
-                        : 'border-transparent bg-slate-800 hover:bg-slate-800/80'
-                    )}
-                    onClick={() => setSelectedAgentId(agent.id)}
-                  >
-                    <div class="font-semibold">{agent.name}</div>
-                    <div class="text-xs text-slate-400">{agent.id}</div>
-                  </button>
-                  <button
-                    class={clsx(
-                      'rounded-full border px-2 py-1 text-sm transition',
-                      active() ? 'border-emerald-400 text-emerald-300' : 'border-slate-700 text-slate-300 hover:border-slate-500'
-                    )}
-                    aria-label={`${active() ? 'Remove' : 'Add'} ${agent.name} ${active() ? 'from' : 'to'} conversation`}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      active() ? removeAgentFromConversation(agent.id) : addAgentToConversation(agent.id)
-                    }}
-                  >
-                    {active() ? '−' : '+'}
-                  </button>
-                </div>
-              )
-            }}
-          </For>
-          <Show when={loadingAgents()}>
-            <div class="text-xs text-slate-400">Loading agents…</div>
-          </Show>
+      <aside class="w-72 border-r border-slate-800 bg-slate-900/70 p-4 overflow-y-auto">
+        <div class="space-y-6">
+          <section>
+            <div class="flex items-center justify-between">
+              <h1 class="text-lg font-semibold">Conversations</h1>
+              <button
+                class="rounded bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-900 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => void handleCreateConversation()}
+                disabled={isLoadingConversations()}
+              >
+                New Conversation
+              </button>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">Switch between persisted threads. Conversations survive reloads and server restarts.</p>
+            <div class="mt-4 space-y-3">
+              <Show when={conversationSummaries().length} fallback={<p class="text-xs text-slate-500">No conversations yet.</p>}>
+                <For each={conversationSummaries()}>
+                  {(summary: ConversationSummary) => {
+                    const active = () => conversationState().conversationId === summary.id
+                    return (
+                      <div class="flex items-start gap-2">
+                        <button
+                          class={clsx(
+                            'flex-1 rounded-xl border px-3 py-2 text-left text-sm transition',
+                            active()
+                              ? 'border-emerald-400 bg-emerald-500/10'
+                              : 'border-slate-800 bg-slate-900/60 hover:border-slate-600'
+                          )}
+                          onClick={() => void openConversation(summary.id)}
+                        >
+                          <div class="font-semibold text-slate-100">{summary.title || 'Untitled conversation'}</div>
+                          <div class="text-[11px] text-slate-400">
+                            {summary.last_message_preview || 'No messages yet.'}
+                          </div>
+                        </button>
+                        <div class="flex gap-1">
+                          <button
+                            class="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-slate-500"
+                            aria-label="Rename conversation"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void handleRenameConversation(summary.id)
+                            }}
+                          >
+                            ✎
+                          </button>
+                          <button
+                            class="rounded border border-slate-700 px-2 py-1 text-xs text-rose-200 hover:border-rose-400"
+                            aria-label="Delete conversation"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void handleDeleteConversation(summary.id)
+                            }}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      </div>
+                    )
+                  }}
+                </For>
+              </Show>
+              <Show when={isLoadingConversations()}>
+                <div class="text-xs text-slate-400">Loading conversations…</div>
+              </Show>
+            </div>
+          </section>
+
+          <section>
+            <div class="flex items-center justify-between">
+              <h2 class="text-lg font-semibold">Agents</h2>
+              <button
+                class="rounded bg-emerald-500 px-3 py-1 text-sm font-semibold text-slate-900 hover:bg-emerald-400"
+                onClick={handleCreateAgent}
+              >
+                New Agent
+              </button>
+            </div>
+            <p class="mt-1 text-xs text-slate-400">Toggle agents into the shared conversation and edit their settings.</p>
+            <div class="mt-4 space-y-2">
+              <For each={agents()}>
+                {(agent: Agent) => {
+                  const active = () => isAgentActive(agent.id)
+                  return (
+                    <div class="flex items-center gap-2">
+                      <button
+                        class={clsx(
+                          'flex-1 rounded border px-3 py-2 text-left text-sm transition',
+                          agent.id === selectedAgentId()
+                            ? 'border-emerald-400 bg-emerald-500/10'
+                            : 'border-transparent bg-slate-800 hover:bg-slate-800/80'
+                        )}
+                        onClick={() => setSelectedAgentId(agent.id)}
+                      >
+                        <div class="font-semibold">{agent.name}</div>
+                        <div class="text-xs text-slate-400">{agent.id}</div>
+                      </button>
+                      <button
+                        class={clsx(
+                          'rounded-full border px-2 py-1 text-sm transition',
+                          active() ? 'border-emerald-400 text-emerald-300' : 'border-slate-700 text-slate-300 hover:border-slate-500'
+                        )}
+                        aria-label={`${active() ? 'Remove' : 'Add'} ${agent.name} ${active() ? 'from' : 'to'} conversation`}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          active() ? removeAgentFromConversation(agent.id) : addAgentToConversation(agent.id)
+                        }}
+                      >
+                        {active() ? '−' : '+'}
+                      </button>
+                    </div>
+                  )
+                }}
+              </For>
+              <Show when={loadingAgents()}>
+                <div class="text-xs text-slate-400">Loading agents…</div>
+              </Show>
+            </div>
+          </section>
         </div>
       </aside>
 
@@ -569,8 +735,11 @@ const App = () => {
         <section class="flex flex-1 min-h-0 flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div class="space-y-1">
-              <h2 class="text-lg font-semibold">Chat · {selectedAgent()?.name ?? 'Choose an active agent'}</h2>
-              <p class="text-xs text-slate-400">Streaming responses via WebSocket ({WS_URL}).</p>
+              <h2 class="text-lg font-semibold">
+                {(conversationState().title ?? 'Conversation') + ' · '}
+                {selectedAgent()?.name ?? 'Choose an active agent'}
+              </h2>
+              <p class="text-xs text-slate-400">Streaming responses via WebSocket ({socketUrlHint()}).</p>
               <Show when={statusMessage()}>
                 <p class={`text-xs ${statusToneClass()}`}>{statusMessage()}</p>
               </Show>
@@ -590,9 +759,9 @@ const App = () => {
               </label>
               <button
                 class="rounded border border-slate-700 px-2 py-1 text-xs hover:border-slate-500"
-                onClick={handleClearConversation}
+                onClick={() => void handleCreateConversation()}
               >
-                Clear Chat
+                New Conversation
               </button>
               <div class="flex flex-col gap-1 text-[11px] text-slate-400">
                 <label class="uppercase tracking-wide" for="person-name-input">
@@ -706,17 +875,12 @@ const App = () => {
               <button
                 class="rounded-2xl bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-900 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-slate-700"
                 disabled={!canSendMessage()}
-                onClick={handleSendMessage}
+                onClick={() => void handleSendMessage()}
               >
                 Send
               </button>
               <Show when={isStreaming()}>
-                <button
-                  class="rounded-2xl border border-amber-400 px-4 py-2 text-sm text-amber-200 hover:bg-amber-500/10"
-                  onClick={() => stopActiveStream(true)}
-                >
-                  Stop
-                </button>
+                <span class="text-xs text-slate-400">Agents are responding…</span>
               </Show>
             </div>
           </div>

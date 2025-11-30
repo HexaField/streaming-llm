@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .agent_store import AgentStore
+from .conversation_events import ConversationEventBus
 from .conversation_manager import ConversationManager
+from .conversation_orchestrator import ConversationOrchestrator
 from .model_engine import StreamingLLMEngine
 from .settings import get_settings
 
@@ -20,8 +23,13 @@ class StreamCancelled(Exception):
 
 settings = get_settings()
 agent_store = AgentStore(settings.agents_dir)
-conversation_manager = ConversationManager()
+conversation_manager = ConversationManager(
+    settings.conversations_dir,
+    max_turns=settings.conversation_max_turns,
+)
+event_bus = ConversationEventBus()
 engine: Optional[StreamingLLMEngine] = None
+orchestrator: Optional[ConversationOrchestrator] = None
 
 
 def get_engine() -> StreamingLLMEngine:
@@ -29,6 +37,18 @@ def get_engine() -> StreamingLLMEngine:
     if engine is None:
         engine = StreamingLLMEngine(settings)
     return engine
+
+
+def get_orchestrator() -> ConversationOrchestrator:
+    global orchestrator
+    if orchestrator is None:
+        orchestrator = ConversationOrchestrator(
+            conversation_manager,
+            agent_store,
+            event_bus,
+            get_engine(),
+        )
+    return orchestrator
 
 
 class AgentPayload(BaseModel):
@@ -46,6 +66,48 @@ class AgentUpdateRequest(BaseModel):
 
 class AgentListResponse(BaseModel):
     agents: list[AgentPayload]
+
+
+class ConversationMessagePayload(BaseModel):
+    id: str
+    role: str
+    content: str
+    name: Optional[str] = None
+    speaker_id: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+class ConversationSummaryPayload(BaseModel):
+    id: str
+    title: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    message_count: int
+    last_message_preview: Optional[str] = None
+    active_agents: List[str] = Field(default_factory=list)
+
+
+class ConversationDetailPayload(ConversationSummaryPayload):
+    messages: List[ConversationMessagePayload]
+
+
+class ConversationCreateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ConversationUpdateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ConversationMessageRequest(BaseModel):
+    content: str
+    speaker_role: Optional[str] = None
+    speaker_name: Optional[str] = None
+    speaker_id: Optional[str] = None
+
+
+class ConversationAgentUpdateRequest(BaseModel):
+    active_agent_ids: List[str]
 
 
 app = FastAPI(title="StreamingLLM Multi-Agent Backend")
@@ -91,6 +153,116 @@ def upsert_agent(agent_id: str, payload: AgentUpdateRequest) -> AgentPayload:
         markdown_context=payload.markdown_context,
     )
     return AgentPayload(**agent.to_dict())
+
+
+@app.get("/conversations", response_model=List[ConversationSummaryPayload])
+def list_conversations() -> List[ConversationSummaryPayload]:
+    summaries = conversation_manager.list_conversations()
+    return [_serialize_conversation_summary(item) for item in summaries]
+
+
+@app.post("/conversations", response_model=ConversationDetailPayload)
+def create_conversation(payload: ConversationCreateRequest) -> ConversationDetailPayload:
+    conversation = conversation_manager.create(title=payload.title)
+    return _serialize_conversation_detail(conversation)
+
+
+@app.get("/conversations/{conversation_id}", response_model=ConversationDetailPayload)
+def get_conversation(conversation_id: str) -> ConversationDetailPayload:
+    conversation = conversation_manager.get(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return _serialize_conversation_detail(conversation)
+
+
+@app.put("/conversations/{conversation_id}", response_model=ConversationDetailPayload)
+def rename_conversation(
+    conversation_id: str, payload: ConversationUpdateRequest
+) -> ConversationDetailPayload:
+    conversation = conversation_manager.rename(conversation_id, payload.title or "")
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return _serialize_conversation_detail(conversation)
+
+
+@app.delete("/conversations/{conversation_id}")
+def delete_conversation(conversation_id: str) -> Dict[str, str]:
+    deleted = conversation_manager.delete(conversation_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "deleted"}
+
+
+@app.post(
+    "/conversations/{conversation_id}/messages",
+    response_model=ConversationMessagePayload,
+)
+async def post_conversation_message(
+    conversation_id: str, payload: ConversationMessageRequest
+) -> ConversationMessagePayload:
+    conversation = conversation_manager.get(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    content = (payload.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Message content cannot be blank")
+    role = (payload.speaker_role or "PERSON").strip().upper() or "PERSON"
+    message = conversation_manager.append(
+        conversation_id,
+        role,
+        content,
+        name=payload.speaker_name,
+        speaker_id=payload.speaker_id,
+        message_id=str(uuid4()),
+    )
+    await event_bus.broadcast(
+        conversation_id,
+        {
+            "type": "message_appended",
+            "conversation_id": conversation_id,
+            "message": _serialize_message(message).dict(),
+        },
+    )
+    await get_orchestrator().handle_new_message(conversation_id, message)
+    return _serialize_message(message)
+
+
+@app.put(
+    "/conversations/{conversation_id}/active_agents",
+    response_model=ConversationDetailPayload,
+)
+async def update_conversation_agents(
+    conversation_id: str,
+    payload: ConversationAgentUpdateRequest,
+) -> ConversationDetailPayload:
+    updated = conversation_manager.set_active_agents(
+        conversation_id, payload.active_agent_ids
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return _serialize_conversation_detail(updated)
+
+
+@app.websocket("/ws/conversations/{conversation_id}")
+async def conversation_events(websocket: WebSocket, conversation_id: str) -> None:
+    await websocket.accept()
+    if not conversation_manager.get(conversation_id):
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "Conversation not found"})
+        )
+        await websocket.close()
+        return
+    await event_bus.subscribe(conversation_id, websocket)
+    await websocket.send_text(
+        json.dumps({"type": "ready", "conversation_id": conversation_id})
+    )
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await event_bus.unsubscribe(conversation_id, websocket)
 
 
 @app.websocket("/ws/chat")
@@ -247,3 +419,47 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run("backend.server:app", host="0.0.0.0", port=8000, reload=False)
+
+
+def _serialize_conversation_summary(data: Dict[str, Any]) -> ConversationSummaryPayload:
+    messages = data.get("messages") or []
+    raw_count = data.get("message_count")
+    message_count = int(raw_count) if raw_count is not None else len(messages)
+    preview = data.get("last_message_preview")
+    if not preview and messages:
+        preview = messages[-1].get("content", "")[:160]
+    return ConversationSummaryPayload(
+        id=data["id"],
+        title=data.get("title") or f"Conversation {data['id'][:8]}",
+        created_at=data.get("created_at"),
+        updated_at=data.get("updated_at"),
+        message_count=message_count,
+        last_message_preview=preview,
+        active_agents=list(data.get("active_agents") or []),
+    )
+
+
+def _serialize_conversation_detail(data: Dict[str, Any]) -> ConversationDetailPayload:
+    messages = data.get("messages", [])
+    summary = _serialize_conversation_summary(
+        {
+            **data,
+            "message_count": len(messages),
+            "last_message_preview": (messages[-1]["content"][:160] if messages else None),
+        }
+    )
+    return ConversationDetailPayload(
+        **summary.dict(),
+        messages=[_serialize_message(message) for message in messages],
+    )
+
+
+def _serialize_message(message: Dict[str, Any]) -> ConversationMessagePayload:
+    return ConversationMessagePayload(
+        id=message.get("id") or str(uuid4()),
+        role=message.get("role", ""),
+        content=message.get("content", ""),
+        name=message.get("name"),
+        speaker_id=message.get("speaker_id"),
+        timestamp=message.get("timestamp"),
+    )

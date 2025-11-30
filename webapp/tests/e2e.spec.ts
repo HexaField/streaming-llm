@@ -17,7 +17,7 @@ test.describe('StreamingLLM multi-agent chat', () => {
 
     await expect(page.getByRole('button', { name: /^Planner/i })).toBeVisible()
 
-    await page.getByRole('button', { name: 'New' }).click()
+    await page.getByRole('button', { name: 'New Agent' }).click()
     await page.getByLabel('Agent Name').fill(agentName)
     await page.getByLabel('System Prompt').fill(systemPrompt)
     await page.getByLabel('Markdown Context').fill(markdownContext)
@@ -34,6 +34,7 @@ test.describe('StreamingLLM multi-agent chat', () => {
 
     const input = page.getByPlaceholder('Send a message…')
     await input.fill(chatMessage)
+    await expect(page.getByRole('button', { name: 'Send' })).toBeEnabled({ timeout: 60_000 })
     await page.getByRole('button', { name: 'Send' }).click()
 
     const assistantBubble = page.locator('[data-testid="message-assistant"]').last()

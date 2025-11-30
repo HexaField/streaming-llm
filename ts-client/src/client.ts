@@ -37,6 +37,36 @@ export interface AgentUpdateRequest {
   markdown_context: string;
 }
 
+export interface ConversationMessage {
+  id: string;
+  role: string;
+  content: string;
+  name?: string;
+  speaker_id?: string;
+  timestamp?: string;
+}
+
+export interface ConversationSummary {
+  id: string;
+  title: string;
+  created_at?: string;
+  updated_at?: string;
+  message_count: number;
+  last_message_preview?: string;
+  active_agents: string[];
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: ConversationMessage[];
+}
+
+export interface ConversationMessageRequest {
+  content: string;
+  speaker_role?: string;
+  speaker_name?: string;
+  speaker_id?: string;
+}
+
 export function streamChat({
   backendUrl,
   agentId,
@@ -126,6 +156,83 @@ export async function updateAgent(
       system_prompt: agent.system_prompt,
       markdown_context: agent.markdown_context,
     }),
+  });
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function listConversations(apiBase = "http://localhost:8000"): Promise<ConversationSummary[]> {
+  const res = await fetch(`${apiBase}/conversations`);
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function createConversation(
+  payload: { title?: string } = {},
+  apiBase = "http://localhost:8000"
+): Promise<ConversationDetail> {
+  const res = await fetch(`${apiBase}/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function getConversation(
+  conversationId: string,
+  apiBase = "http://localhost:8000"
+): Promise<ConversationDetail> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}`);
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function renameConversation(
+  conversationId: string,
+  payload: { title?: string },
+  apiBase = "http://localhost:8000"
+): Promise<ConversationDetail> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function deleteConversation(conversationId: string, apiBase = "http://localhost:8000"): Promise<void> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}`, {
+    method: "DELETE",
+  });
+  await ensureOk(res);
+}
+
+export async function sendConversationMessage(
+  conversationId: string,
+  payload: ConversationMessageRequest,
+  apiBase = "http://localhost:8000"
+): Promise<ConversationMessage> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res);
+  return res.json();
+}
+
+export async function updateConversationAgents(
+  conversationId: string,
+  agentIds: string[],
+  apiBase = "http://localhost:8000"
+): Promise<ConversationDetail> {
+  const res = await fetch(`${apiBase}/conversations/${conversationId}/active_agents`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ active_agent_ids: agentIds }),
   });
   await ensureOk(res);
   return res.json();
