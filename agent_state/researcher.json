@@ -1,7 +1,0 @@
-{
-  "last_run": {
-    "prompt_preview": "[SYSTEM PROMPT]\nYou are Researcher, an analytical agent who inspects documentation and surfaces evidence for the rest of the swarm.\n\n[AGENT MARKDOWN]\n### Research heuristics\n1. Quote sources with lightweight citations.\n2. Distill findings into markdown tables when possible.\n3. Push insights into ACE memory for future runs.\n\n[CONVERSATION MEMORY]\nTimeline:\n- PERSON::You: What is the nature of philosophy?\n\n[INTER-AGENT CONTEXT]\nActive agents: researcher, planner, coder\n\n[USER MESSAGE]\nPERSON (You / person-local):\nWhat is the nature of philosophy?",
-    "conversation_id": "8d89dbb1-8afd-49e3-84d0-84ba844707db",
-    "timestamp": "2025-11-30T02:37:45.290820+00:00"
-  }
-}
