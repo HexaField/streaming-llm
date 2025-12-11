@@ -1,14 +1,16 @@
-import torch
 import argparse
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-)
+import importlib.util
+import json
+import os
 import os.path as osp
 import ssl
 import urllib.request
-import os
-import json
+
+import torch
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+)
 
 
 def parse_args():
@@ -47,6 +49,9 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def _has_accelerate() -> bool:
+    return importlib.util.find_spec("accelerate") is not None
+
 
 def load(model_name_or_path):
     print(f"Loading model from {model_name_or_path} ...")
@@ -55,11 +60,15 @@ def load(model_name_or_path):
         model_name_or_path,
         trust_remote_code=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        device_map="auto",
+    model_kwargs = dict(
         torch_dtype=torch.float16,
         trust_remote_code=True,
+    )
+    if _has_accelerate():
+        model_kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name_or_path,
+        **model_kwargs,
     )
     if tokenizer.pad_token_id is None:
         if tokenizer.eos_token_id is not None:
